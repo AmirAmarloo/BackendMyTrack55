@@ -44,7 +44,7 @@ def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
 
         # 2. Get company details via company_users
         company_query = text("""
-            SELECT c.id, c.name 
+            SELECT c.id, c.name, cu.role
             FROM timetracker.companies c
             JOIN timetracker.company_users cu ON cu.company_id = c.id
             WHERE cu.id = :cu_id
@@ -57,7 +57,7 @@ def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
                 detail="Company or company user not found."
             )
 
-        company_id, company_name = company_row
+        company_id, company_name, user_role = company_row
         schema_name = f"tenant_{str(company_id).replace('-', '_')}"
 
         # 3. Fetch active projects from tenant schema
@@ -96,6 +96,7 @@ def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
             "clientName": company_name,
             "tenantSchema": schema_name,
             "authToken": auth_jwt,
+            "role": user_role or "employee",
             "projects": projects_list
         }
 
