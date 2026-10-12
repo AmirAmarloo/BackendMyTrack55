@@ -7,6 +7,9 @@ import logging
 from datetime import date
 from uuid import uuid4
 
+import uuid
+import time
+
 logger = logging.getLogger("uvicorn")
 
 app = FastAPI(title="Time Tracker API")
@@ -52,6 +55,34 @@ class AbsenceRequest(BaseModel):
 
     class Config:
         populate_by_name = True
+
+# مدل‌های ورودی (Pydantic Models)
+class ClientCreate(BaseModel):
+    tenantSchema: str
+    clientName: str
+    description:Optional[str] = None
+
+class ProjectCreate(BaseModel):
+    tenantSchema: str
+    clientId: Optional[int] = None
+    clientName: str
+    projectName: str
+    budgetHours: Optional[float] = None
+
+
+class ClientCreate(BaseModel):
+    tenantSchema: str
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    taxId: Optional[str] = None
+
+class ProjectCreate(BaseModel):
+    tenantSchema: str
+    clientId: str
+    name: str
+    description: Optional[str] = None
 
 
 # --- تابع ساخت هوشمند جداول ۵‌گانه در شیمای شرکت ---
@@ -357,4 +388,173 @@ def get_user_absences(tenantSchema: str, user_id: str, db: Session = Depends(get
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch absences: {str(e)}")
 
-    
+
+@app.get("/admin/monthly-report")
+def get_monthly_audit_report(
+    tenantSchema: str, 
+    year: int, 
+    month: int, 
+    db: Session = Depends(get_db)
+):
+    try:
+        # استفاده از ستون‌های واقعی موجود در جدول شما (duration به جای total_break_duration)
+        query_entries = text(f"""
+            SELECT 
+                user_id,
+                client_name,
+                project_name,
+                duration,
+                start_time
+            FROM {tenantSchema}.time_entries
+            WHERE EXTRACT(YEAR FROM TIMESTAMP 'epoch' + start_time * INTERVAL '1 millisecond') = :year
+              AND EXTRACT(MONTH FROM TIMESTAMP 'epoch' + start_time * INTERVAL '1 millisecond') = :month
+        """)
+        
+        entries = db.execute(query_entries, {"year": year, "month": month}).fetchall()
+        
+        query_absences = text(f"""
+            SELECT 
+                user_id,
+                absence_type,
+                start_date,
+                end_date,
+                is_approved
+            FROM {tenantSchema}.absences
+            WHERE (EXTRACT(YEAR FROM start_date) = :year AND EXTRACT(MONTH FROM start_date) = :month)
+               OR (EXTRACT(YEAR FROM end_date) = :year AND EXTRACT(MONTH FROM end_date) = :month)
+        """)
+        
+        absences = db.execute(query_absences, {"year": year, "month": month}).fetchall()
+        
+        return {
+            "year": year,
+            "month": month,
+            "totalEntriesCount": len(entries),
+            "absencesCount": len(absences),
+            "entries": [
+                {
+                    "userId": e.user_id,
+                    "clientName": e.client_name,
+                    "projectName": e.project_name,
+                    "durationMinutes": e.duration,
+                    "breakMinutes": 0,
+                    "startTime": str(e.start_time)
+                } for e in entries
+            ],
+            "absences": [
+                {
+                    "userId": a.user_id if hasattr(a, 'user_id') else 'usr_default',
+                    "absenceType": a.absence_type,
+                    "startDate": str(a.start_date),
+                    "endDate": str(a.end_date),
+                    "isApproved": a.is_approved
+                } for a in absences
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate monthly report: {str(e)}")
+
+
+@app.get("/projects/list")
+def get_clients_and_projects(tenantSchema: str, db: Session = Depends(get_db)):
+    try:
+        # اطمینان از وجود جداول پایه
+        db.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {tenantSchema}.clients (
+                id UUID PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                email VARCHAR(255),
+                phone VARCHAR(50),
+                address TEXT,
+                tax_id VARCHAR(100),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS {tenantSchema}.projects (
+                id UUID PRIMARY KEY,
+                company_id UUID,
+                client_id UUID REFERENCES {tenantSchema}.clients(id) ON DELETE CASCADE,
+                name VARCHAR(255) NOT NULL,
+                description TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+        db.commit()
+
+        # خواندن مشتریان به همراه پروژه‌های مرتبط
+        clients_query = text(f"SELECT id, name, email, phone, address, tax_id FROM {tenantSchema}.clients ORDER BY name")
+        clients_result = db.execute(clients_query).fetchall()
+
+        clients_data = []
+        for c in clients_result:
+            proj_query = text(f"SELECT id, name, description, is_active FROM {tenantSchema}.projects WHERE client_id = :client_id ORDER BY name")
+            projects_result = db.execute(proj_query, {"client_id": c.id}).fetchall()
+            
+            projects_list = [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "isActive": p.isActive if hasattr(p, 'isActive') else p.is_active
+                } for p in projects_result
+            ]
+            
+            clients_data.append({
+                "id": c.id,
+                "name": c.name,
+                "email": c.email,
+                "phone": c.phone,
+                "address": c.address,
+                "taxId": c.tax_id,
+                "projects": projects_list
+            })
+
+        return {"clients": clients_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch data: {str(e)}")
+
+@app.post("/clients/create")
+def create_client(data: ClientCreate, db: Session = Depends(get_db)):
+    try:
+        client_id = str(uuid.uuid4())
+        query = text(f"""
+            INSERT INTO {data.tenantSchema}.clients (id, name, email, phone, address, tax_id)
+            VALUES (:id, :name, :email, :phone, :address, :tax_id)
+        """)
+        db.execute(query, {
+            "id": client_id,
+            "name": data.name.strip(),
+            "email": data.email,
+            "phone": data.phone,
+            "address": data.address,
+            "tax_id": data.taxId
+        })
+        db.commit()
+        return {"status": "success", "clientId": client_id, "message": "Client created successfully"}
+    except Exception as e:
+        db.rollback()
+        print("DATABASE ERROR:", str(e))  # این خط را برای چاپ در ترمینال اضافه کنید
+        raise HTTPException(status_code=500, detail=f"Failed to create client: {str(e)}")
+
+@app.post("/projects/create")
+def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
+    try:
+        project_id = str(uuid.uuid4())
+        query = text(f"""
+            INSERT INTO {data.tenantSchema}.projects (id, client_id, name, description)
+            VALUES (:id, :client_id, :name, :description)
+        """)
+        db.execute(query, {
+            "id": project_id,
+            "client_id": data.clientId,
+            "name": data.name.strip(),
+            "description": data.description
+        })
+        db.commit()
+        return {"status": "success", "projectId": project_id, "message": "Project created successfully"}
+    except Exception as e:
+        db.rollback()
+        print("PROJECT DATABASE ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to create project: {str(e)}")

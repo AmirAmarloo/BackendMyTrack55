@@ -19,3 +19,4 @@ class ActivationResponse(BaseModel):
     tenantSchema: str
     authToken: str
     projects: List[ProjectSchema]
+
