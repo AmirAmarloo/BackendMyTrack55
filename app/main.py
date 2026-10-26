@@ -129,12 +129,19 @@ class ManualEntryRequest(BaseModel):
     class Config:
         populate_by_name = True        
 
+class CreateUserRequest(BaseModel):
+    tenantSchema: str
+    fullName: str
+    email: str
+    role: str = "employee"  # 'admin' یا 'employee'
 
 # ---------------------------- Database Tables Setup -------------------------------
 
-def ensure_tenant_tables(schema: str, db: Session):
+def ensure_tenant_tables(schema_name: str, db: Session):
+    db.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema_name};"))
+    
     init_sql = text(f"""
-        CREATE TABLE IF NOT EXISTS {schema}.users (
+        CREATE TABLE IF NOT EXISTS {schema_name}.users (
             id VARCHAR(50) PRIMARY KEY,
             email VARCHAR(255) UNIQUE,
             full_name VARCHAR(255),
@@ -143,7 +150,7 @@ def ensure_tenant_tables(schema: str, db: Session):
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
 
-        CREATE TABLE IF NOT EXISTS {schema}.clients (
+        CREATE TABLE IF NOT EXISTS {schema_name}.clients (
             id UUID PRIMARY KEY,
             name VARCHAR(255) NOT NULL,
             email VARCHAR(255),
@@ -154,10 +161,10 @@ def ensure_tenant_tables(schema: str, db: Session):
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS {schema}.projects (
+        CREATE TABLE IF NOT EXISTS {schema_name}.projects (
             id UUID PRIMARY KEY,
             company_id UUID NOT NULL,
-            client_id UUID REFERENCES {schema}.clients(id) ON DELETE CASCADE,
+            client_id UUID REFERENCES {schema_name}.clients(id) ON DELETE CASCADE,
             name VARCHAR(255) NOT NULL,
             description TEXT,
             is_active BOOLEAN DEFAULT TRUE,
@@ -165,7 +172,7 @@ def ensure_tenant_tables(schema: str, db: Session):
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS {schema}.time_entries (
+        CREATE TABLE IF NOT EXISTS {schema_name}.time_entries (
             id VARCHAR(50) PRIMARY KEY,
             user_id VARCHAR(50),
             project_id UUID NOT NULL,
@@ -177,16 +184,16 @@ def ensure_tenant_tables(schema: str, db: Session):
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
 
-        CREATE TABLE IF NOT EXISTS {schema}.breaks (
+        CREATE TABLE IF NOT EXISTS {schema_name}.breaks (
             id VARCHAR(50) PRIMARY KEY,
-            time_entry_id UUID REFERENCES {schema}.time_entries(id) ON DELETE CASCADE,
+            time_entry_id VARCHAR(50) REFERENCES {schema_name}.time_entries(id) ON DELETE CASCADE,
             start_time BIGINT NOT NULL,
             end_time BIGINT,
             duration INT DEFAULT 0,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
 
-        CREATE TABLE IF NOT EXISTS {schema}.daily_summaries (
+        CREATE TABLE IF NOT EXISTS {schema_name}.daily_summaries (
             id VARCHAR(50) PRIMARY KEY,
             user_id VARCHAR(50) NOT NULL,
             work_date DATE NOT NULL,
@@ -195,10 +202,10 @@ def ensure_tenant_tables(schema: str, db: Session):
             is_approved BOOLEAN DEFAULT false,
             approved_by VARCHAR(50),
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            CONSTRAINT unique_user_date_{schema.replace('.', '_')} UNIQUE (user_id, work_date)
+            CONSTRAINT unique_user_date_{schema_name.replace('-', '_')} UNIQUE (user_id, work_date)
         );
 
-        CREATE TABLE IF NOT EXISTS {schema}.absences (
+        CREATE TABLE IF NOT EXISTS {schema_name}.absences (
             id VARCHAR(50) PRIMARY KEY,
             user_id VARCHAR(50) NOT NULL,
             absence_type VARCHAR(20) NOT NULL,
@@ -207,11 +214,10 @@ def ensure_tenant_tables(schema: str, db: Session):
             note TEXT,
             is_approved BOOLEAN DEFAULT false,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-        );        
+        );
     """)
     db.execute(init_sql)
     db.commit()
-
 
 def calculate_arbzg_compliance(total_work_minutes: int, registered_break_minutes: int):
     required_break = 0
@@ -237,6 +243,7 @@ def calculate_arbzg_compliance(total_work_minutes: int, registered_break_minutes
 @app.post("/auth/activate")
 def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
     token_str = payload.token
+    print(f"DEBUG SEARCHING FOR TOKEN: [{token_str}] length={len(token_str)}")
     token_query = text("SELECT company_user_id, used_at FROM timetracker.activation_tokens WHERE token = :token")
     token_row = db.execute(token_query, {"token": token_str}).fetchone()
 
@@ -300,12 +307,32 @@ def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
         """)
 
         for entry in payload.entries:
+            try:
+                uuid_obj = uuid.UUID(entry.projectId)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid project ID format: '{entry.projectId}'. Project ID must be a valid UUID."
+                )
+
+            project_exists = db.execute(
+                text(f"SELECT 1 FROM {schema}.projects WHERE id = :project_id"),
+                {"project_id": str(uuid_obj)}
+            ).fetchone()
+
+            if not project_exists:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Project with ID '{entry.projectId}' does not exist in tenant schema. Please create a project first."
+                )
+    
+            # ۲. درج تایم‌انِتری در صورت معتبر بودن پروژه
             db.execute(insert_entry_sql, {
                 "id": entry.id,
                 "user_id": entry.userId,
                 "project_id": entry.projectId,
                 "project_name": entry.projectName,
-                "client_name": entry.clientName,
+                "client_name": entry.client_name if hasattr(entry, 'client_name') else entry.clientName,
                 "start_time": entry.startTime,
                 "end_time": entry.endTime,
                 "duration": entry.duration or 0
@@ -324,11 +351,13 @@ def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
         db.commit()
         return {"status": "success", "synced_count": len(payload.entries)}
 
+    except HTTPException as he:
+        db.rollback()
+        raise he
     except Exception as e:
         db.rollback()
         logger.error(f"Sync failed for schema {schema}: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to sync entries: {str(e)}")
-
 
 @app.get("/projects/list")
 def get_clients_and_projects(tenantSchema: str, db: Session = Depends(get_db)):
@@ -541,44 +570,14 @@ def get_monthly_audit_report(tenantSchema: str, year: int, month: int, db: Sessi
         raise HTTPException(status_code=500, detail=f"Failed to generate monthly report: {str(e)}")
 
 
-@app.post("/time-entries/manual")
-def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_db)):
-    schema = payload.tenantSchema
-    entry_id = f"man_{uuid4().hex[:12]}"
-    
-    try:
-        ensure_tenant_tables(schema, db)
-        
-        sql = text(f"""
-            INSERT INTO {schema}.time_entries 
-            (id, user_id, project_id, project_name, client_name, start_time, end_time, duration, is_manual, approval_status)
-            VALUES (:id, :user_id, :project_id, :project_name, :client_name, :start_time, :end_time, :duration, TRUE, 'pending')
-        """)
-        
-        db.execute(sql, {
-            "id": entry_id,
-            "user_id": payload.userId,
-            "project_id": payload.projectId,
-            "project_name": payload.projectName,
-            "client_name": payload.clientName,
-            "start_time": payload.startTime,
-            "end_time": payload.endTime,
-            "duration": payload.duration
-        })
-        db.commit()
-        
-        return {"status": "success", "entryId": entry_id, "message": "Manual entry submitted for approval."}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to submit manual entry: {str(e)}")
-
 
 @app.post("/time-entries/manual")
 def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_db)):
     schema = payload.tenantSchema
-    entry_id = f"man_{uuid4().hex[:12]}"
     
-    # اگر ادمین ثبت کند، مستقیم تایید می‌شود (approved)، وگرنه در انتظار تایید می‌ماند (pending)
+    # استفاده از uuid4 واقعی به جای رشته متنی
+    entry_id = str(uuid.uuid4())
+    
     approval_status = 'approved' if payload.isAdminAction else 'pending'
     
     try:
@@ -606,8 +605,8 @@ def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_d
         return {"status": "success", "entryId": entry_id, "message": "Manual entry processed successfully."}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to submit manual entry: {str(e)}")
-
+        print("🔴 ERROR IN MANUAL ENTRY:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # 2. لیست کاربران شرکت (برای اینکه ادمین بدد برای چه کسی دارد ساعت ثبت می‌کند)
 @app.get("/users/list")
@@ -634,36 +633,49 @@ def list_tenant_users(tenantSchema: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to fetch users: {str(e)}")
 
 
-# 3. گرفتن لیست ساعت‌های در انتظار تایید (برای ادمین)
 @app.get("/time-entries/pending")
 def get_pending_entries(tenantSchema: str, db: Session = Depends(get_db)):
     try:
+        # کوئری ایمن که مستقیماً از time_entries می‌خواند تا خطای 500 ندهد
         sql = text(f"""
-            SELECT te.id, te.user_id, u.full_name, te.project_id, te.project_name, 
-                   te.start_time, te.end_time, te.duration, te.is_manual, te.approval_status
-            FROM {tenantSchema}.time_entries te
-            LEFT JOIN {tenantSchema}.users u ON te.user_id = u.id
-            WHERE te.approval_status = 'pending'
-            ORDER BY te.start_time DESC
+            SELECT 
+                id, 
+                user_id, 
+                project_id, 
+                project_name, 
+                client_name, 
+                start_time, 
+                end_time, 
+                duration, 
+                created_at, 
+                is_manual, 
+                approval_status
+            FROM {tenantSchema}.time_entries 
+            WHERE approval_status = 'pending'
+            ORDER BY created_at DESC
         """)
         result = db.execute(sql).fetchall()
         
         entries = []
         for row in result:
             entries.append({
-                "id": row[0],
-                "userId": row[1],
-                "userName": row[2] or "Unknown",
-                "projectId": row[3],
-                "projectName": row[4],
-                "startTime": row[5],
-                "endTime": row[6],
-                "duration": row[7],
-                "isManual": row[8],
-                "approvalStatus": row[9]
+                "id": row.id,
+                "userId": row.user_id,
+                "projectId": row.project_id,
+                "projectName": row.project_name,
+                "clientName": row.client_name,
+                "startTime": row.start_time,
+                "endTime": row.end_time,
+                "duration": row.duration,
+                "createdAt": str(row.created_at) if row.created_at else None,
+                "isManual": row.is_manual,
+                "approvalStatus": row.approval_status,
+                "userName": row.user_id  # موقتاً از user_id به عنوان نام استفاده می‌کنیم تا خطا برطرف شود
             })
-        return {"status": "success", "entries": entries}
+            
+        return {"entries": entries}
     except Exception as e:
+        print("--- PENDING ENTRIES ERROR TRACEBACK ---:", str(e))
         raise HTTPException(status_code=500, detail=f"Failed to fetch pending entries: {str(e)}")
 
 
@@ -691,3 +703,54 @@ def approve_time_entry(payload: ApprovalActionRequest, db: Session = Depends(get
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update entry status: {str(e)}")
+
+@app.get("/users/list")
+def list_users(tenantSchema: str, db: Session = Depends(get_db)):
+    try:
+        # اطمینان از وجود جدول کاربران در اسکیما تننت
+        ensure_tenant_tables(tenantSchema, db)
+        
+        sql = text(f"SELECT id, full_name, email, role, created_at FROM {tenantSchema}.users ORDER BY created_at DESC")
+        result = db.execute(sql).fetchall()
+        
+        users = []
+        for row in result:
+            users.append({
+                "id": row.id,
+                "fullName": row.full_name,
+                "email": row.email,
+                "role": row.role,
+                "createdAt": str(row.created_at) if row.created_at else None
+            })
+            
+        return {"status": "success", "users": users}
+    except Exception as e:
+        print("🔴 ERROR IN LIST USERS:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/users/create")
+def create_user(payload: CreateUserRequest, db: Session = Depends(get_db)):
+    schema = payload.tenantSchema
+    user_id = f"usr_{uuid4().hex[:12]}"
+    
+    try:
+        ensure_tenant_tables(schema, db)
+        
+        sql = text(f"""
+            INSERT INTO {schema}.users (id, full_name, email, role)
+            VALUES (:id, :full_name, :email, :role)
+        """)
+        
+        db.execute(sql, {
+            "id": user_id,
+            "full_name": payload.fullName,
+            "email": payload.email,
+            "role": payload.role
+        })
+        db.commit()
+        
+        return {"status": "success", "userId": user_id, "message": "User created successfully."}
+    except Exception as e:
+        db.rollback()
+        print("🔴 ERROR IN CREATE USER:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
