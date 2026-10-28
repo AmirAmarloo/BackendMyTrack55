@@ -5,8 +5,11 @@ from sqlalchemy import text
 from pydantic import BaseModel, Field
 import logging
 from uuid import uuid4
-
 import uuid
+from fastapi import APIRouter, HTTPException, Query
+import psycopg2
+
+router = APIRouter()
 
 logger = logging.getLogger("uvicorn")
 
@@ -135,6 +138,11 @@ class CreateUserRequest(BaseModel):
     email: str
     role: str = "employee"  # 'admin' یا 'employee'
 
+class AssignProjectRequest(BaseModel):
+    tenantSchema: str
+    userId: str
+    projectId: str
+
 # ---------------------------- Database Tables Setup -------------------------------
 
 def ensure_tenant_tables(schema_name: str, db: Session):
@@ -215,6 +223,14 @@ def ensure_tenant_tables(schema_name: str, db: Session):
             is_approved BOOLEAN DEFAULT false,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS {schema_name}.user_projects (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL,
+            project_id VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (user_id, project_id)
+        );        
     """)
     db.execute(init_sql)
     db.commit()
@@ -275,10 +291,10 @@ def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
         "clientName": company_name,
         "tenantSchema": schema_name,
         "authToken": f"Bearer_secret_token_for_{company_user_id}",
+        "userId": str(company_user_id),
         "role": user_role or "employee",
         "projects": projects_list
     }
-
 
 @app.post("/time-entries/sync")
 def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
@@ -510,7 +526,7 @@ def get_user_absences(tenantSchema: str, user_id: str, db: Session = Depends(get
     try:
         sql = text(f"""
             SELECT id, absence_type, start_date, end_date, note, is_approved
-            FROM {schema}.absences WHERE user_id = :user_id ORDER BY start_date DESC
+            FROM {tenantSchema}.absences WHERE user_id = :user_id ORDER BY start_date DESC
         """).bindparams(schema=tenantSchema)
         rows = db.execute(sql, {"user_id": user_id}).fetchall()
         result = [{
@@ -636,7 +652,6 @@ def list_tenant_users(tenantSchema: str, db: Session = Depends(get_db)):
 @app.get("/time-entries/pending")
 def get_pending_entries(tenantSchema: str, db: Session = Depends(get_db)):
     try:
-        # کوئری ایمن که مستقیماً از time_entries می‌خواند تا خطای 500 ندهد
         sql = text(f"""
             SELECT 
                 id, 
@@ -670,12 +685,12 @@ def get_pending_entries(tenantSchema: str, db: Session = Depends(get_db)):
                 "createdAt": str(row.created_at) if row.created_at else None,
                 "isManual": row.is_manual,
                 "approvalStatus": row.approval_status,
-                "userName": row.user_id  # موقتاً از user_id به عنوان نام استفاده می‌کنیم تا خطا برطرف شود
+                "userName": row.user_id  # نام یا شناسه کاربر برای ادمین
             })
             
         return {"entries": entries}
     except Exception as e:
-        print("--- PENDING ENTRIES ERROR TRACEBACK ---:", str(e))
+        print("--- PENDING ERROR ---:", str(e))
         raise HTTPException(status_code=500, detail=f"Failed to fetch pending entries: {str(e)}")
 
 
@@ -753,4 +768,56 @@ def create_user(payload: CreateUserRequest, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         print("🔴 ERROR IN CREATE USER:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/projects/assign")
+def assign_project(data: AssignProjectRequest, db: Session = Depends(get_db)):
+    try:
+        ensure_tenant_tables(data.tenantSchema, db)
+        
+        insert_query = text(f"""
+            INSERT INTO {data.tenantSchema}.user_projects (user_id, project_id)
+            VALUES (:user_id, :project_id)
+            ON CONFLICT (user_id, project_id) DO NOTHING;
+        """)
+        db.execute(insert_query, {"user_id": data.userId, "project_id": data.projectId})
+        db.commit()
+        
+        return {"status": "success", "message": "Project successfully assigned to user."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/projects/assigned-list")
+def get_assigned_projects(
+    tenantSchema: str = Query(...), 
+    userId: str = Query(...), 
+    isAdmin: bool = Query(False),
+    db: Session = Depends(get_db)
+):
+    try:
+        ensure_tenant_tables(tenantSchema, db)
+        
+        if isAdmin:
+            query = text(f"SELECT id, name, description, is_active FROM {tenantSchema}.projects;")
+            result = db.execute(query).fetchall()
+        else:
+            query = text(f"""
+                SELECT p.id, p.name, p.description, p.is_active FROM {tenantSchema}.projects p
+                JOIN {tenantSchema}.user_projects up ON p.id::text = up.project_id
+                WHERE up.user_id = :user_id;
+            """)
+            result = db.execute(query, {"user_id": userId}).fetchall()
+            
+        projects_list = [{
+            "id": str(row.id),
+            "name": row.name,
+            "description": row.description,
+            "isActive": row.is_active
+        } for row in result]
+        
+        return {"status": "success", "projects": projects_list}
+        
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
