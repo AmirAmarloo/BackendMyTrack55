@@ -1,13 +1,14 @@
 from typing import List, Optional
 from fastapi import Depends, HTTPException, status, FastAPI
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import UUID, text
 from pydantic import BaseModel, Field
 import logging
 from uuid import uuid4
 import uuid
 from fastapi import APIRouter, HTTPException, Query
 import psycopg2
+from uuid import UUID
 
 router = APIRouter()
 
@@ -143,6 +144,14 @@ class AssignProjectRequest(BaseModel):
     userId: str
     projectId: str
 
+class CompanyRegistrationRequest(BaseModel):
+    companyName: str = Field(..., alias="companyName")
+    adminName: str = Field(..., alias="adminName")
+    adminEmail: str = Field(..., alias="adminEmail")
+
+    class Config:
+        populate_by_name = True
+
 # ---------------------------- Database Tables Setup -------------------------------
 
 def ensure_tenant_tables(schema_name: str, db: Session):
@@ -231,6 +240,11 @@ def ensure_tenant_tables(schema_name: str, db: Session):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (user_id, project_id)
         );        
+
+        ALTER TABLE timetracker.users 
+        ADD COLUMN IF NOT EXISTS email VARCHAR(255) UNIQUE,
+        ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+
     """)
     db.execute(init_sql)
     db.commit()
@@ -258,44 +272,66 @@ def calculate_arbzg_compliance(total_work_minutes: int, registered_break_minutes
 
 @app.post("/auth/activate")
 def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
-    token_str = payload.token
-    print(f"DEBUG SEARCHING FOR TOKEN: [{token_str}] length={len(token_str)}")
-    token_query = text("SELECT company_user_id, used_at FROM timetracker.activation_tokens WHERE token = :token")
-    token_row = db.execute(token_query, {"token": token_str}).fetchone()
+    try:
+        # ۱. پیدا کردن توکن و اطلاعات کاربر و شرکت از اسکیمای timetracker
+        token_row = db.execute(text("""
+            SELECT t.company_user_id, cu.company_id, c.id AS comp_id
+            FROM timetracker.activation_tokens t
+            JOIN timetracker.company_users cu ON t.company_user_id = cu.id
+            JOIN timetracker.companies c ON cu.company_id = c.id
+            WHERE t.token = :token AND t.expires_at > NOW() AND t.used_at IS NULL
+        """), {"token": payload.token}).fetchone()
 
-    if not token_row:
-        raise HTTPException(status_code=400, detail="Invalid token")
-    if token_row.used_at is not None:
-        raise HTTPException(status_code=400, detail="Token already used")
+        if not token_row:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    company_user_id = token_row.company_user_id
-    company_query = text("SELECT c.id, c.name, cu.role FROM timetracker.companies c JOIN timetracker.company_users cu ON cu.company_id = c.id WHERE cu.id = :cu_id")
-    company_row = db.execute(company_query, {"cu_id": company_user_id}).fetchone()
+        user_uuid = token_row.company_user_id
+        company_uuid = token_row.company_id
+        
+        # ساخت نام اسکیما از روی UUID شرکت
+        schema_name = f"tenant_{str(company_uuid).replace('-', '_')}"
 
-    if not company_row:
-        raise HTTPException(status_code=400, detail="Company user not found")
+        # ۲. خواندن پروژه‌ها با استفاده از Savepoint (برای جلوگیری از ابورت شدن تراکنش اصلی)
+        projects_list = []
+        try:
+            with db.begin_nested(): # ایجاد یک نقطه ذخیره موقت (Savepoint)
+                projects_query = text(f"""
+                    SELECT p.id, p.name
+                    FROM {schema_name}.projects p
+                    JOIN {schema_name}.user_projects up ON up.project_id = p.id
+                    WHERE up.user_id = :u_id::uuid AND p.is_active = true
+                """)
+                projects_rows = db.execute(projects_query, {"u_id": str(user_uuid)}).fetchall()
+                projects_list = [{"id": str(r.id), "name": r.name} for r in projects_rows]
+        except Exception as ex:
+            print(f"Notice: Could not fetch projects from tenant schema yet: {ex}")
+            projects_list = [] # اگر جدول‌ها هنوز ساخته نشده‌اند، لیست خالی برمی‌گرداند تا درخواست متوقف نشود
 
-    company_id, company_name, user_role = company_row
-    schema_name = f"tenant_{str(company_id).replace('-', '_')}"
+        # ۳. به روزرسانی توکن به عنوان استفاده شده
+        db.execute(text("""
+            UPDATE timetracker.activation_tokens 
+            SET used_at = NOW() 
+            WHERE token = :token
+        """), {"token": payload.token})
 
-    ensure_tenant_tables(schema_name, db)
+        db.commit()
+        
+        return {
+            "status": "activated",
+            "userId": str(user_uuid),
+            "companyId": str(company_uuid),
+            "schemaName": schema_name,
+            "projects": projects_list
+        }
 
-    projects_query = text(f"SELECT id, name FROM {schema_name}.projects WHERE is_active = true")
-    projects_rows = db.execute(projects_query).fetchall()
-    projects_list = [{"id": str(r.id), "name": r.name} for r in projects_rows]
-
-    db.execute(text("UPDATE timetracker.activation_tokens SET used_at = NOW() WHERE token = :token"), {"token": token_str})
-    db.commit()
-
-    return {
-        "clientName": company_name,
-        "tenantSchema": schema_name,
-        "authToken": f"Bearer_secret_token_for_{company_user_id}",
-        "userId": str(company_user_id),
-        "role": user_role or "employee",
-        "projects": projects_list
-    }
-
+    except HTTPException as he:
+        db.rollback()
+        raise he
+    except Exception as e:
+        db.rollback()
+        print(f"ERROR IN activate_device: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+            
 @app.post("/time-entries/sync")
 def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
     schema = payload.tenantSchema
@@ -777,8 +813,7 @@ def assign_project(data: AssignProjectRequest, db: Session = Depends(get_db)):
         
         insert_query = text(f"""
             INSERT INTO {data.tenantSchema}.user_projects (user_id, project_id)
-            VALUES (:user_id, :project_id)
-            ON CONFLICT (user_id, project_id) DO NOTHING;
+            VALUES (:user_id, :project_id);
         """)
         db.execute(insert_query, {"user_id": data.userId, "project_id": data.projectId})
         db.commit()
@@ -821,3 +856,125 @@ def get_assigned_projects(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/create-employee-token", response_model=None)
+def create_employee_token(company_id: str, employee_name: str, role: str = "employee", db: Session = Depends(get_db)):
+    import uuid
+    try:
+        comp_uuid = UUID(company_id)
+        new_user_id = uuid.uuid4()
+        new_token = f"EMP_TOKEN_{uuid.uuid4().hex[:8]}"
+        
+        # ۱. بررسی وجود شرکت در جدول مرکزی
+        comp_check = db.execute(text("SELECT id FROM timetracker.companies WHERE id = :comp_id"), {"comp_id": comp_uuid}).fetchone()
+        if not comp_check:
+            raise HTTPException(status_code=400, detail="Company ID does not exist in database!")
+        
+        # ۲. ساخت نام اسکیما به روش استاندارد
+        schema_name = f"tenant_{str(comp_uuid).replace('-', '_')}"
+
+        # ۳. درج در جدول مرکزی users
+        db.execute(text("""
+            INSERT INTO timetracker.users (id, display_name, role) 
+            VALUES (:user_id, :display_name, :role)
+            ON CONFLICT (id) DO NOTHING
+        """), {"user_id": new_user_id, "display_name": employee_name, "role": role})
+
+        # ۴. درج در جدول مرکزی company_users (برای رفع خطای کلید خارجی جدول توکن‌ها)
+        db.execute(text("""
+            INSERT INTO timetracker.company_users (id, company_id, user_id, status, role) 
+            VALUES (:id, :comp_id, :user_id, 'active', :role)
+            ON CONFLICT (id) DO NOTHING
+        """), {
+            "id": new_user_id, 
+            "comp_id": comp_uuid, 
+            "user_id": new_user_id,
+            "role": role
+        })
+
+        # ۵. درج کاربر در جدولِ اسکیمای اختصاصی شرکت (برای هماهنگی با لیست کاربران)
+        db.execute(text(f"""
+            INSERT INTO {schema_name}.users (id, full_name, role, is_active) 
+            VALUES (:user_id, :full_name, :role, true)
+            ON CONFLICT (id) DO NOTHING
+        """), {
+            "user_id": new_user_id, 
+            "full_name": employee_name, 
+            "role": role
+        })
+
+        # ۶. درج توکن فعال‌سازی در جدول مرکزی توکن‌ها
+        db.execute(text("""
+            INSERT INTO timetracker.activation_tokens (company_user_id, token, expires_at) 
+            VALUES (:user_id, :token, NOW() + INTERVAL '7 days')
+        """), {
+            "user_id": new_user_id, 
+            "token": new_token
+        })
+        
+        db.commit()
+        return {"token": new_token, "userId": str(new_user_id), "role": role}
+        
+    except Exception as e:
+        db.rollback()
+        print(f"ERROR IN create_employee_token: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+            
+@app.post("/auth/register-company")
+def register_company(payload: CompanyRegistrationRequest, db: Session = Depends(get_db)):
+    try:
+        company_id = uuid.uuid4()
+        admin_user_id = uuid.uuid4()
+        schema_name = f"tenant_{str(company_id).replace('-', '_')}"
+
+        # ۱. درج شرکت در جدول مرکزی companies
+        db.execute(text("""
+            INSERT INTO timetracker.companies (id, name)
+            VALUES (:id, :name)
+        """), {"id": company_id, "name": payload.companyName})
+
+        # ۲. درج ادمین در جدول مرکزی users
+        db.execute(text("""
+            INSERT INTO timetracker.users (id, display_name, role)
+            VALUES (:id, :display_name, 'admin')
+        """), {"id": admin_user_id, "display_name": payload.adminName})
+
+        # ۳. اتصال ادمین به شرکت در جدول company_users
+        db.execute(text("""
+            INSERT INTO timetracker.company_users (id, company_id, user_id, status, role)
+            VALUES (:id, :comp_id, :user_id, 'active', 'admin')
+        """), {
+            "id": admin_user_id,
+            "comp_id": company_id,
+            "user_id": admin_user_id
+        })
+
+        # ۴. ایجاد اسکیمای اختصاصی تننت و جدول‌های آن
+        ensure_tenant_tables(schema_name, db)
+
+        # ۵. درج ادمین در جدول usersِ اسکیمای تننت
+        db.execute(text(f"""
+            INSERT INTO {schema_name}.users (id, full_name, email, role)
+            VALUES (:id, :full_name, :email, 'admin')
+            ON CONFLICT (email) DO NOTHING
+        """), {
+            "id": str(admin_user_id),
+            "full_name": payload.adminName,
+            "email": payload.adminEmail
+        })
+
+        db.commit()
+
+        return {
+            "status": "success",
+            "companyId": str(company_id),
+            "adminId": str(admin_user_id),
+            "tenantSchema": schema_name,
+            "role": "admin",
+            "message": "Company and Admin registered successfully."
+        }
+
+    except Exception as e:
+        db.rollback()
+        print(f"ERROR IN register_company: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))    
