@@ -9,6 +9,11 @@ import uuid
 from fastapi import APIRouter, HTTPException, Query
 import psycopg2
 from uuid import UUID
+from passlib.context import CryptContext
+from pydantic import BaseModel
+import bcrypt
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")   
 
 router = APIRouter()
 
@@ -99,6 +104,7 @@ class ManualEntryRequest(BaseModel):
     endTime: int = Field(..., alias="endTime")
     duration: int = Field(..., alias="duration")
     note: str = Field(..., alias="note") # علت فراموشی یا ثبت دستی
+    isAdminAction: Optional[bool] = Field(False, alias="isAdminAction")
 
     class Config:
         populate_by_name = True
@@ -138,6 +144,7 @@ class CreateUserRequest(BaseModel):
     fullName: str
     email: str
     role: str = "employee"  # 'admin' یا 'employee'
+    includeInReports: bool = True
 
 class AssignProjectRequest(BaseModel):
     tenantSchema: str
@@ -152,6 +159,23 @@ class CompanyRegistrationRequest(BaseModel):
     class Config:
         populate_by_name = True
 
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+class ActivationPayload(BaseModel):
+    token: str
+    email: str
+    password: str
+
+    class Config:
+        populate_by_name = True    
+
+
+class ReportStatusPayload(BaseModel):
+    includeInReports: bool
+    tenantSchema: str
+
 # ---------------------------- Database Tables Setup -------------------------------
 
 def ensure_tenant_tables(schema_name: str, db: Session):
@@ -164,7 +188,8 @@ def ensure_tenant_tables(schema_name: str, db: Session):
             full_name VARCHAR(255),
             role VARCHAR(50) DEFAULT 'employee',
             is_active BOOLEAN DEFAULT true,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            include_in_reports BOOLEAN DEFAULT TRUE
         );
 
         CREATE TABLE IF NOT EXISTS {schema_name}.clients (
@@ -195,8 +220,10 @@ def ensure_tenant_tables(schema_name: str, db: Session):
             project_id UUID NOT NULL,
             project_name VARCHAR(255) NOT NULL,
             client_name VARCHAR(255),
+            is_manual BOOLEAN DEFAULT false,
             start_time BIGINT NOT NULL,
             end_time BIGINT,
+            approval_status VARCHAR(20) DEFAULT 'approved',
             duration INT DEFAULT 0,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
@@ -241,7 +268,21 @@ def ensure_tenant_tables(schema_name: str, db: Session):
             UNIQUE (user_id, project_id)
         );        
 
+        CREATE TABLE IF NOT EXISTS {schema_name}.audit_logs (
+            id VARCHAR(36) PRIMARY KEY,
+            admin_id VARCHAR(36),
+            action_type VARCHAR(100) NOT NULL,
+            target_type VARCHAR(100),
+            target_id VARCHAR(36),
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         ALTER TABLE timetracker.users 
+        ADD COLUMN IF NOT EXISTS email VARCHAR(255) UNIQUE,
+        ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+
+        ALTER TABLE {schema_name}.users 
         ADD COLUMN IF NOT EXISTS email VARCHAR(255) UNIQUE,
         ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
 
@@ -268,14 +309,35 @@ def calculate_arbzg_compliance(total_work_minutes: int, registered_break_minutes
     }
 
 
+def log_audit_event(db: Session, schema: str, admin_id: str, action_type: str, target_type: str, target_id: str, details: str):
+    try:
+        log_id = str(uuid.uuid4())
+        sql = text(f"""
+            INSERT INTO {schema}.audit_logs (id, admin_id, action_type, target_type, target_id, details, created_at)
+            VALUES (:id, :admin_id, :action_type, :target_type, :target_id, :details, NOW())
+        """)
+        db.execute(sql, {
+            "id": log_id,
+            "admin_id": admin_id or "system_admin",
+            "action_type": action_type,
+            "target_type": target_type,
+            "target_id": target_id,
+            "details": details
+        })
+        db.commit()
+    except Exception as e:
+        print("🔴 ERROR IN AUDIT LOG:", str(e))
+
+
 # --- Endpoints ---
 
-@app.post("/auth/activate")
-def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
+
+@app.post("/auth/activate", response_model=None)
+def activate_token(payload: ActivationPayload, db: Session = Depends(get_db)):
     try:
-        # ۱. پیدا کردن توکن و اطلاعات کاربر و شرکت از اسکیمای timetracker
+        # ۱. اصلاح کوئری برای استخراج صحیحِ user_id اصلی (cu.user_id به جای t.company_user_id)
         token_row = db.execute(text("""
-            SELECT t.company_user_id, cu.company_id, c.id AS comp_id
+            SELECT cu.user_id, cu.company_id 
             FROM timetracker.activation_tokens t
             JOIN timetracker.company_users cu ON t.company_user_id = cu.id
             JOIN timetracker.companies c ON cu.company_id = c.id
@@ -283,31 +345,31 @@ def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
         """), {"token": payload.token}).fetchone()
 
         if not token_row:
-            raise HTTPException(status_code=400, detail="Invalid or expired token")
+            raise HTTPException(status_code=400, detail="Invalid or expired activation token.")
 
-        user_uuid = token_row.company_user_id
-        company_uuid = token_row.company_id
+        user_id = token_row[0]  # این حالا دقیقاً شناسه‌ی واقعی کاربر در جدول users است
+        comp_id = token_row[1]
         
-        # ساخت نام اسکیما از روی UUID شرکت
-        schema_name = f"tenant_{str(company_uuid).replace('-', '_')}"
+        schema_name = f"tenant_{str(comp_id).replace('-', '_')}"
 
-        # ۲. خواندن پروژه‌ها با استفاده از Savepoint (برای جلوگیری از ابورت شدن تراکنش اصلی)
-        projects_list = []
-        try:
-            with db.begin_nested(): # ایجاد یک نقطه ذخیره موقت (Savepoint)
-                projects_query = text(f"""
-                    SELECT p.id, p.name
-                    FROM {schema_name}.projects p
-                    JOIN {schema_name}.user_projects up ON up.project_id = p.id
-                    WHERE up.user_id = :u_id::uuid AND p.is_active = true
-                """)
-                projects_rows = db.execute(projects_query, {"u_id": str(user_uuid)}).fetchall()
-                projects_list = [{"id": str(r.id), "name": r.name} for r in projects_rows]
-        except Exception as ex:
-            print(f"Notice: Could not fetch projects from tenant schema yet: {ex}")
-            projects_list = [] # اگر جدول‌ها هنوز ساخته نشده‌اند، لیست خالی برمی‌گرداند تا درخواست متوقف نشود
+        # هش کردن پسورد با bcrypt
+        password_hash = bcrypt.hashpw(payload.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-        # ۳. به روزرسانی توکن به عنوان استفاده شده
+        # ۲. به‌روزرسانی جدول مرکزی users با شناسه صحیح
+        db.execute(text("""
+            UPDATE timetracker.users 
+            SET email = :email, password_hash = :password_hash 
+            WHERE id = :user_id
+        """), {"email": payload.email, "password_hash": password_hash, "user_id": str(user_id)})
+
+        # ۳. به‌روزرسانی جدول اسکیمای اختصاصی شرکت
+        db.execute(text(f"""
+            UPDATE {schema_name}.users 
+            SET email = :email, password_hash = :password_hash 
+            WHERE id = :user_id
+        """), {"email": payload.email, "password_hash": password_hash, "user_id": str(user_id)})
+
+        # ۴. علامت‌زدن توکن به عنوان استفاده‌شده
         db.execute(text("""
             UPDATE timetracker.activation_tokens 
             SET used_at = NOW() 
@@ -315,21 +377,11 @@ def activate_device(payload: ActivationRequest, db: Session = Depends(get_db)):
         """), {"token": payload.token})
 
         db.commit()
-        
-        return {
-            "status": "activated",
-            "userId": str(user_uuid),
-            "companyId": str(company_uuid),
-            "schemaName": schema_name,
-            "projects": projects_list
-        }
+        return {"status": "success", "message": "Account activated successfully. You can now log in."}
 
-    except HTTPException as he:
-        db.rollback()
-        raise he
     except Exception as e:
         db.rollback()
-        print(f"ERROR IN activate_device: {str(e)}")
+        print(f"ERROR IN activate_token: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
             
 @app.post("/time-entries/sync")
@@ -563,7 +615,7 @@ def get_user_absences(tenantSchema: str, user_id: str, db: Session = Depends(get
         sql = text(f"""
             SELECT id, absence_type, start_date, end_date, note, is_approved
             FROM {tenantSchema}.absences WHERE user_id = :user_id ORDER BY start_date DESC
-        """).bindparams(schema=tenantSchema)
+        """)
         rows = db.execute(sql, {"user_id": user_id}).fetchall()
         result = [{
             "id": r.id,
@@ -581,12 +633,15 @@ def get_user_absences(tenantSchema: str, user_id: str, db: Session = Depends(get
 @app.get("/admin/monthly-report")
 def get_monthly_audit_report(tenantSchema: str, year: int, month: int, db: Session = Depends(get_db)):
     try:
+        # دریافت تمام رکوردهای ماه همراه با وضعیت تایید
         query_entries = text(f"""
-            SELECT user_id, client_name, project_name, duration, start_time
-            FROM {tenantSchema}.time_entries
-            WHERE EXTRACT(YEAR FROM TIMESTAMP 'epoch' + start_time * INTERVAL '1 millisecond') = :year
-              AND EXTRACT(MONTH FROM TIMESTAMP 'epoch' + start_time * INTERVAL '1 millisecond') = :month
-        """)
+            SELECT e.user_id, e.client_name, e.project_name, e.duration, e.start_time, e.approval_status, COALESCE(u.include_in_reports, TRUE) as include_in_reports
+            FROM {tenantSchema}.time_entries e
+            LEFT JOIN {tenantSchema}.users u ON e.user_id::text = u.id::text
+            WHERE EXTRACT(YEAR FROM TIMESTAMP 'epoch' + e.start_time * INTERVAL '1 millisecond') = :year
+              AND EXTRACT(MONTH FROM TIMESTAMP 'epoch' + e.start_time * INTERVAL '1 millisecond') = :month
+              --AND COALESCE(u.include_in_reports, TRUE) = TRUE
+        """)        
         entries = db.execute(query_entries, {"year": year, "month": month}).fetchall()
         
         query_absences = text(f"""
@@ -597,19 +652,23 @@ def get_monthly_audit_report(tenantSchema: str, year: int, month: int, db: Sessi
         """)
         absences = db.execute(query_absences, {"year": year, "month": month}).fetchall()
         
+        formatted_entries = [{
+            "userId": e.user_id,
+            "clientName": e.client_name,
+            "projectName": e.project_name,
+            "durationMinutes": e.duration,
+            "breakMinutes": 0,
+            "startTime": str(e.start_time),
+            "approvalStatus": e.approval_status or "pending",
+            "includeInReports": bool(e.include_in_reports)
+        } for e in entries]
+
         return {
             "year": year,
             "month": month,
             "totalEntriesCount": len(entries),
             "absencesCount": len(absences),
-            "entries": [{
-                "userId": e.user_id,
-                "clientName": e.client_name,
-                "projectName": e.project_name,
-                "durationMinutes": e.duration,
-                "breakMinutes": 0,
-                "startTime": str(e.start_time)
-            } for e in entries],
+            "entries": formatted_entries,
             "absences": [{
                 "userId": a.user_id if hasattr(a, 'user_id') else 'usr_default',
                 "absenceType": a.absence_type,
@@ -661,36 +720,33 @@ def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_d
         raise HTTPException(status_code=500, detail=str(e))
 
 # 2. لیست کاربران شرکت (برای اینکه ادمین بدد برای چه کسی دارد ساعت ثبت می‌کند)
-@app.get("/users/list")
-def list_tenant_users(tenantSchema: str, db: Session = Depends(get_db)):
+@app.get("/admin/users-list")
+def get_tenant_users(tenantSchema: str, db: Session = Depends(get_db)):
     try:
-        sql = text(f"""
-            SELECT id, full_name, email, role, is_active 
-            FROM {tenantSchema}.users 
-            ORDER BY full_name ASC
+        query = text(f"""
+            SELECT id, display_name, email, role, COALESCE(include_in_reports, TRUE) as include_in_reports 
+            FROM {tenantSchema}.users
         """)
-        result = db.execute(sql).fetchall()
-        
-        users = []
-        for row in result:
-            users.append({
-                "id": row[0],
-                "fullName": row[1],
-                "email": row[2],
-                "role": row[3],
-                "isActive": row[4]
-            })
-        return {"status": "success", "users": users}
+        users = db.execute(query).fetchall()
+        return [
+            {
+                "id": u.id,
+                "displayName": u.display_name,
+                "email": u.email,
+                "role": u.role,
+                "includeInReports": bool(u.include_in_reports)
+            } for u in users
+        ]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch users: {str(e)}")
-
+        print("ERROR IN users-list:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/time-entries/pending")
 def get_pending_entries(tenantSchema: str, db: Session = Depends(get_db)):
     try:
         sql = text(f"""
             SELECT 
-                id, 
+                ti.id, 
                 user_id, 
                 project_id, 
                 project_name, 
@@ -698,10 +754,12 @@ def get_pending_entries(tenantSchema: str, db: Session = Depends(get_db)):
                 start_time, 
                 end_time, 
                 duration, 
-                created_at, 
+                ti.created_at, 
                 is_manual, 
-                approval_status
-            FROM {tenantSchema}.time_entries 
+                approval_status,
+                u.full_name AS user_name
+            FROM {tenantSchema}.time_entries ti
+            JOIN {tenantSchema}.users u ON ti.user_id = u.id
             WHERE approval_status = 'pending'
             ORDER BY created_at DESC
         """)
@@ -721,7 +779,7 @@ def get_pending_entries(tenantSchema: str, db: Session = Depends(get_db)):
                 "createdAt": str(row.created_at) if row.created_at else None,
                 "isManual": row.is_manual,
                 "approvalStatus": row.approval_status,
-                "userName": row.user_id  # نام یا شناسه کاربر برای ادمین
+                "userName": row.user_name  # نام یا شناسه کاربر برای ادمین
             })
             
         return {"entries": entries}
@@ -749,6 +807,7 @@ def approve_time_entry(payload: ApprovalActionRequest, db: Session = Depends(get
             WHERE id = :entry_id
         """)
         db.execute(sql, {"status": payload.status, "entry_id": payload.entryId})
+        
         db.commit()
         return {"status": "success", "message": f"Entry status updated to {payload.status}"}
     except Exception as e:
@@ -756,29 +815,30 @@ def approve_time_entry(payload: ApprovalActionRequest, db: Session = Depends(get
         raise HTTPException(status_code=500, detail=f"Failed to update entry status: {str(e)}")
 
 @app.get("/users/list")
-def list_users(tenantSchema: str, db: Session = Depends(get_db)):
+def get_users_list(tenantSchema: str, db: Session = Depends(get_db)):
     try:
-        # اطمینان از وجود جدول کاربران در اسکیما تننت
-        ensure_tenant_tables(tenantSchema, db)
+        query = text(f"""
+            SELECT id, full_name, email, role, COALESCE(include_in_reports, TRUE) as include_in_reports 
+            FROM {tenantSchema}.users
+        """)
+        users = db.execute(query).fetchall()
         
-        sql = text(f"SELECT id, full_name, email, role, created_at FROM {tenantSchema}.users ORDER BY created_at DESC")
-        result = db.execute(sql).fetchall()
-        
-        users = []
-        for row in result:
-            users.append({
-                "id": row.id,
-                "fullName": row.full_name,
-                "email": row.email,
-                "role": row.role,
-                "createdAt": str(row.created_at) if row.created_at else None
-            })
-            
-        return {"status": "success", "users": users}
+        return {
+            "users": [
+                {
+                    "id": str(u.id),
+                    "fullName": u.full_name,
+                    "email": u.email,
+                    "role": u.role,
+                    "includeInReports": bool(u.include_in_reports)
+                } for u in users
+            ]
+        }
     except Exception as e:
-        print("🔴 ERROR IN LIST USERS:", str(e))
+        print("ERROR IN /users/list:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+    
 @app.post("/users/create")
 def create_user(payload: CreateUserRequest, db: Session = Depends(get_db)):
     schema = payload.tenantSchema
@@ -788,15 +848,16 @@ def create_user(payload: CreateUserRequest, db: Session = Depends(get_db)):
         ensure_tenant_tables(schema, db)
         
         sql = text(f"""
-            INSERT INTO {schema}.users (id, full_name, email, role)
-            VALUES (:id, :full_name, :email, :role)
+            INSERT INTO {schema}.users (id, full_name, email, role, include_in_reports)
+            VALUES (:id, :full_name, :email, :role, :include_in_reports)
         """)
         
         db.execute(sql, {
             "id": user_id,
             "full_name": payload.fullName,
             "email": payload.email,
-            "role": payload.role
+            "role": payload.role,
+            "include_in_reports": payload.includeInReports
         })
         db.commit()
         
@@ -843,7 +904,10 @@ def get_assigned_projects(
                 JOIN {tenantSchema}.user_projects up ON p.id::text = up.project_id
                 WHERE up.user_id = :user_id;
             """)
-            result = db.execute(query, {"user_id": userId}).fetchall()
+            print(f"DEBUG ---> SQL Query: {query}")
+            params = {"user_id": userId}
+            print(f"DEBUG ---> SQL Params: {params}")
+            result = db.execute(query, params).fetchall()
             
         projects_list = [{
             "id": str(row.id),
@@ -978,3 +1042,87 @@ def register_company(payload: CompanyRegistrationRequest, db: Session = Depends(
         db.rollback()
         print(f"ERROR IN register_company: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))    
+
+
+import bcrypt 
+
+@app.post("/auth/login", response_model=None)
+def login(payload: LoginPayload, db: Session = Depends(get_db)):
+    try:
+        # ۱. پیدا کردن کاربر از روی ایمیل در جدول مرکزی
+        user_row = db.execute(text("""
+            SELECT id, display_name, role, password_hash 
+            FROM timetracker.users 
+            WHERE email = :email
+        """), {"email": payload.email}).fetchone()
+
+        if not user_row or not user_row[3]:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        user_id = user_row[0]
+        stored_password_hash = user_row[3]
+        role = user_row[2]
+
+        # ۲. اعتبارسنجی رمز عبور با bcrypt.checkpw (به جای pwd_context.verify)
+        is_valid = bcrypt.checkpw(
+            payload.password.encode('utf-8'), 
+            stored_password_hash.encode('utf-8')
+        )
+
+        if not is_valid:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        # ۳. پیدا کردن شرکت و نام اسکیما مرتبط با این کاربر (تبدیل user_id به رشته برای جلوگیری از خطای UUID)
+        comp_row = db.execute(text("""
+            SELECT c.id FROM timetracker.company_users cu
+            JOIN timetracker.companies c ON cu.company_id = c.id
+            WHERE cu.user_id = :user_id
+        """), {"user_id": str(user_id)}).fetchone()
+
+        if not comp_row:
+            raise HTTPException(status_code=403, detail="User is not assigned to any company.")
+
+        comp_id = comp_row[0]
+        schema_name = f"tenant_{str(comp_id).replace('-', '_')}"
+
+        # ۴. بازگرداندن اطلاعات مورد نیاز برای فرانت‌اند
+        return {
+            "status": "success",
+            "userId": str(user_id),
+            "role": role,
+            "tenantSchema": schema_name,
+            "companyId": str(comp_id)
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"ERROR IN login: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/admin/users/{user_id}/report-status")
+def update_user_report_status(user_id: str, payload: ReportStatusPayload, db: Session = Depends(get_db)):
+    try:
+        sql = text(f"""
+            UPDATE {payload.tenantSchema}.users 
+            SET include_in_reports = :include_in_reports 
+            WHERE id = :user_id
+        """)
+        db.execute(sql, {"include_in_reports": payload.includeInReports, "user_id": user_id})
+        log_audit_event(
+            db=db,
+            schema=payload.tenantSchema,
+            admin_id="admin_user", 
+            action_type="UPDATE_USER_REPORT_STATUS",
+            target_type="USER",
+            target_id=user_id,
+            details=f"Changed include_in_reports to {payload.includeInReports}"
+        )
+        db.commit()
+        
+        return {"status": "success", "message": "User report status updated successfully."}
+    except Exception as e:
+        db.rollback()
+        print("ERROR IN update_user_report_status:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
