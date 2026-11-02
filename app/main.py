@@ -12,6 +12,13 @@ from uuid import UUID
 from passlib.context import CryptContext
 from pydantic import BaseModel
 import bcrypt
+from pydantic import BaseModel
+from typing import List, Optional
+import io
+import csv
+from datetime import datetime
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")   
 
@@ -110,19 +117,6 @@ class ManualEntryRequest(BaseModel):
         populate_by_name = True
 
 
-class ManualEntryRequest(BaseModel):
-    tenantSchema: str = Field(..., alias="tenantSchema")
-    userId: str = Field(..., alias="userId")  # شناسه کارمندی که ساعت برای او ثبت می‌شود
-    projectId: str = Field(..., alias="projectId")
-    projectName: str = Field(..., alias="projectName")
-    clientName: Optional[str] = Field(None, alias="clientName")
-    startTime: int = Field(..., alias="startTime")
-    endTime: int = Field(..., alias="endTime")
-    duration: int = Field(..., alias="duration")
-    note: str = Field(..., alias="note") # دلیل ثبت دستی توسط ادمین یا کاربر
-
-    class Config:
-        populate_by_name = True
 
 class ManualEntryRequest(BaseModel):
     tenantSchema: str = Field(..., alias="tenantSchema")
@@ -135,6 +129,8 @@ class ManualEntryRequest(BaseModel):
     duration: int = Field(..., alias="duration")
     note: str = Field(..., alias="note")
     isAdminAction: Optional[bool] = Field(False, alias="isAdminAction")
+    totalBreakDuration: Optional[int] = 0 
+    breaks: Optional[List[BreakItem]] = []
 
     class Config:
         populate_by_name = True        
@@ -176,6 +172,52 @@ class ReportStatusPayload(BaseModel):
     includeInReports: bool
     tenantSchema: str
 
+class TimeEntrySyncItem(BaseModel):
+    id: str
+    projectId: str
+    projectName: str
+    clientName: Optional[str] = ""
+    startTime: int
+    endTime: Optional[int] = None
+    duration: int
+    note: Optional[str] = ""
+
+class SyncPayload(BaseModel):
+    tenantSchema: str
+    userId: str
+    entries: List[TimeEntrySyncItem]
+
+class BreakItem(BaseModel):
+    id: Optional[str] = None
+    startTime: int
+    endTime: Optional[int] = None
+    duration: Optional[int] = 0
+
+# به‌روزرسانی مدل ورودی برای ثبت دستی یا سنکرون
+class TimeEntryPayloadItem(BaseModel):
+    id: str
+    projectId: str
+    projectName: str
+    clientName: Optional[str] = ""
+    startTime: int
+    endTime: Optional[int] = None
+    duration: int
+    note: Optional[str] = ""
+    breaks: Optional[List[BreakItem]] = []
+    totalBreakDuration: Optional[int] = 0
+
+class ProjectUpdateRequest(BaseModel):
+    tenantSchema: str
+    projectId: str
+    name: str
+    description: Optional[str] = None
+    isActive: bool
+
+class AbsenceApprovalRequest(BaseModel):
+    tenantSchema: str
+    absenceId: str
+    status: str  # 'approved' یا 'rejected'
+
 # ---------------------------- Database Tables Setup -------------------------------
 
 def ensure_tenant_tables(schema_name: str, db: Session):
@@ -185,6 +227,7 @@ def ensure_tenant_tables(schema_name: str, db: Session):
         CREATE TABLE IF NOT EXISTS {schema_name}.users (
             id VARCHAR(50) PRIMARY KEY,
             email VARCHAR(255) UNIQUE,
+            password_hash VARCHAR(255),
             full_name VARCHAR(255),
             role VARCHAR(50) DEFAULT 'employee',
             is_active BOOLEAN DEFAULT true,
@@ -219,13 +262,15 @@ def ensure_tenant_tables(schema_name: str, db: Session):
             user_id VARCHAR(50),
             project_id UUID NOT NULL,
             project_name VARCHAR(255) NOT NULL,
+            note VARCHAR(255) NOT NULL,
             client_name VARCHAR(255),
             is_manual BOOLEAN DEFAULT false,
             start_time BIGINT NOT NULL,
             end_time BIGINT,
             approval_status VARCHAR(20) DEFAULT 'approved',
             duration INT DEFAULT 0,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            synced_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS {schema_name}.breaks (
@@ -329,8 +374,57 @@ def log_audit_event(db: Session, schema: str, admin_id: str, action_type: str, t
         print("🔴 ERROR IN AUDIT LOG:", str(e))
 
 
-# --- Endpoints ---
+def validate_arbzg_rules(duration_minutes: int, break_minutes: int = 0):
+    """
+    بررسی قوانین کار و استراحت آلمان (ArbZG)
+    duration_minutes: زمان خالص کارکرد
+    break_minutes: مجموع زمان استراحت ثبت شده
+    """
+    net_hours = duration_minutes / 60
+    total_span_minutes = duration_minutes + break_minutes
+    total_span_hours = total_span_minutes / 60
 
+    # ۱. سقف ساعت کاری روزانه (حداکثر ۱۰ ساعت)
+    if net_hours > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="ArbZG Violation: Daily net working hours cannot exceed 10 hours."
+        )
+
+    # ۲. قوانین استراحت اجباری بر اساس کل زمان حضور (Span)
+    if total_span_hours > 6 and total_span_hours <= 9:
+        if break_minutes < 30:
+            raise HTTPException(
+                status_code=400,
+                detail="ArbZG Compliance Error: Working over 6 hours requires at least 30 minutes of break."
+            )
+    elif total_span_hours > 9:
+        if break_minutes < 45:
+            raise HTTPException(
+                status_code=400,
+                detail="ArbZG Compliance Error: Working over 9 hours requires at least 45 minutes of break."
+            )
+
+def calculate_break_minutes(breaks: List[BreakItem], total_break_duration: Optional[int] = 0) -> int:
+    if total_break_duration and total_break_duration > 0:
+        return total_break_duration
+    
+    if not breaks:
+        return 0
+        
+    total_mins = 0
+    for b in breaks:
+        if b.duration and b.duration > 0:
+            total_mins += b.duration
+        elif b.endTime and b.startTime:
+            # محاسبه تفاوت زمانی بر حسب دقیقه
+            diff_mins = round((b.endTime - b.startTime) / (1000 * 60))
+            total_mins += max(1, diff_mins)
+            
+    return total_mins
+
+# -------- Endpoints ----------
+#------------------------------
 
 @app.post("/auth/activate", response_model=None)
 def activate_token(payload: ActivationPayload, db: Session = Depends(get_db)):
@@ -393,12 +487,14 @@ def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
 
         insert_entry_sql = text(f"""
             INSERT INTO {schema}.time_entries 
-            (id, user_id, project_id, project_name, client_name, start_time, end_time, duration)
-            VALUES (:id, :user_id, :project_id, :project_name, :client_name, :start_time, :end_time, :duration)
+            (id, user_id, project_id, project_name, client_name, start_time, end_time, duration, note, synced_at)
+            VALUES (:id, :user_id, :project_id, :project_name, :client_name, :start_time, :end_time, :duration, :note, NOW())
             ON CONFLICT (id) DO UPDATE 
             SET end_time = EXCLUDED.end_time, 
                 duration = EXCLUDED.duration,
-                project_name = EXCLUDED.project_name;
+                project_name = EXCLUDED.project_name,
+                note = EXCLUDED.note,
+                synced_at = NOW();
         """)
 
         insert_break_sql = text(f"""
@@ -411,6 +507,7 @@ def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
         """)
 
         for entry in payload.entries:
+            # ۱. اعتبارسنجی UUID پروژه
             try:
                 uuid_obj = uuid.UUID(entry.projectId)
             except ValueError:
@@ -427,42 +524,50 @@ def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
             if not project_exists:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Project with ID '{entry.projectId}' does not exist in tenant schema. Please create a project first."
+                    detail=f"Project with ID '{entry.projectId}' does not exist in tenant schema."
                 )
-    
-            # ۲. درج تایم‌انِتری در صورت معتبر بودن پروژه
+
+            # ۲. محاسبه استراحت و اعتبارسنجی قوانین ArbZG برای هر رکورد
+            break_mins = calculate_break_minutes(entry.breaks, entry.totalBreakDuration)
+            validate_arbzg_rules(entry.duration, break_mins)
+
+            # ۳. درج یا آپدیت تایم‌انری در دیتابیس
             db.execute(insert_entry_sql, {
                 "id": entry.id,
-                "user_id": entry.userId,
+                "user_id": payload.userId,
                 "project_id": entry.projectId,
                 "project_name": entry.projectName,
-                "client_name": entry.client_name if hasattr(entry, 'client_name') else entry.clientName,
+                "client_name": entry.clientName or "",
                 "start_time": entry.startTime,
                 "end_time": entry.endTime,
-                "duration": entry.duration or 0
+                "duration": entry.duration,
+                "note": entry.note or ""
             })
 
+            # ۴. درج یا آپدیت بازه‌های استراحت مربوط به این رکورد (در صورت وجود)
             if entry.breaks:
-                for brk in entry.breaks:
+                for b in entry.breaks:
+                    b_id = b.id or str(uuid.uuid4())
+                    b_duration = b.duration or (round((b.endTime - b.startTime) / (1000 * 60)) if b.endTime else 0)
                     db.execute(insert_break_sql, {
-                        "id": brk.id,
+                        "id": b_id,
                         "time_entry_id": entry.id,
-                        "start_time": brk.startTime,
-                        "end_time": brk.endTime,
-                        "duration": brk.duration or 0
+                        "start_time": b.startTime,
+                        "end_time": b.endTime,
+                        "duration": b_duration
                     })
 
         db.commit()
-        return {"status": "success", "synced_count": len(payload.entries)}
+        return {"status": "success", "message": "All entries synced successfully."}
 
     except HTTPException as he:
         db.rollback()
         raise he
     except Exception as e:
         db.rollback()
-        logger.error(f"Sync failed for schema {schema}: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to sync entries: {str(e)}")
-
+        print("ERROR IN SYNC:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @app.get("/projects/list")
 def get_clients_and_projects(tenantSchema: str, db: Session = Depends(get_db)):
     try:
@@ -685,20 +790,32 @@ def get_monthly_audit_report(tenantSchema: str, year: int, month: int, db: Sessi
 @app.post("/time-entries/manual")
 def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_db)):
     schema = payload.tenantSchema
+
+
     
     # استفاده از uuid4 واقعی به جای رشته متنی
     entry_id = str(uuid.uuid4())
     
     approval_status = 'approved' if payload.isAdminAction else 'pending'
+
     
     try:
         ensure_tenant_tables(schema, db)
         
+        # ۱. ابتدا محاسبه استراحت و اعتبارسنجی قوانین ArbZG
+        break_mins = calculate_break_minutes(payload.breaks, payload.totalBreakDuration)
+        validate_arbzg_rules(payload.duration, break_mins)
+        print(f"🔹 Inserting manual entry: {entry_id} for user {payload.userId} in schema {schema}")
+        print(f"🔹 Start Time: {payload.startTime}, End Time: {payload.endTime}, Duration: {payload.duration}, Break Minutes: {break_mins}")
+        print(f"🔹 Approval Status: {approval_status}, Project: {payload.projectName}, Client: {payload.clientName}")
+
+        # ۲. درج تایم انری در دیتابیس
         sql = text(f"""
             INSERT INTO {schema}.time_entries 
-            (id, user_id, project_id, project_name, client_name, start_time, end_time, duration, is_manual, approval_status)
-            VALUES (:id, :user_id, :project_id, :project_name, :client_name, :start_time, :end_time, :duration, TRUE, :approval_status)
+            (id, user_id, project_id, project_name, client_name, start_time, end_time, duration, is_manual, approval_status, synced_at)
+            VALUES (:id, :user_id, :project_id, :project_name, :client_name, :start_time, :end_time, :duration, TRUE, :approval_status, NOW())
         """)
+        print(f"DEBUG ---> SQL Query: {sql}")
         
         db.execute(sql, {
             "id": entry_id,
@@ -711,14 +828,38 @@ def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_d
             "duration": payload.duration,
             "approval_status": approval_status
         })
+
+        # ۳. درج بازه‌های استراحت (در صورت وجود) در جدول breaks
+        if payload.breaks:
+            insert_break_sql = text(f"""
+                INSERT INTO {schema}.breaks 
+                (id, time_entry_id, start_time, end_time, duration)
+                VALUES (:id, :time_entry_id, :start_time, :end_time, :duration)
+                ON CONFLICT (id) DO NOTHING
+            """)
+            for b in payload.breaks:
+                b_id = b.id or str(uuid.uuid4())
+                b_duration = b.duration or (round((b.endTime - b.startTime) / (1000 * 60)) if b.endTime else 0)
+                db.execute(insert_break_sql, {
+                    "id": b_id,
+                    "time_entry_id": entry_id,
+                    "start_time": b.startTime,
+                    "end_time": b.endTime,
+                    "duration": b_duration
+                })
+
         db.commit()
-        
         return {"status": "success", "entryId": entry_id, "message": "Manual entry processed successfully."}
+        
+    except HTTPException as he:
+        # 👈 مهم: خطای 400 مربوط به قوانین ArbZG بدون دستکاری به فرانت‌اند می‌رسد
+        db.rollback()
+        raise he
     except Exception as e:
         db.rollback()
         print("🔴 ERROR IN MANUAL ENTRY:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 # 2. لیست کاربران شرکت (برای اینکه ادمین بدد برای چه کسی دارد ساعت ثبت می‌کند)
 @app.get("/admin/users-list")
 def get_tenant_users(tenantSchema: str, db: Session = Depends(get_db)):
@@ -1125,4 +1266,257 @@ def update_user_report_status(user_id: str, payload: ReportStatusPayload, db: Se
     except Exception as e:
         db.rollback()
         print("ERROR IN update_user_report_status:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/user-projects/{user_id}")
+def get_user_assigned_projects(tenantSchema: str, user_id: str, db: Session = Depends(get_db)):
+    try:
+        query = text(f"""
+            SELECT p.id, p.project_name, p.client_name
+            FROM {tenantSchema}.user_projects up
+            JOIN {tenantSchema}.projects p ON up.project_id = p.id
+            WHERE up.user_id = :user_id
+        """)
+        projects = db.execute(query, {"user_id": user_id}).fetchall()
+        
+        return [
+            {
+                "id": str(p.id),
+                "projectName": p.project_name,
+                "clientName": p.client_name
+            } for p in projects
+        ]
+    except Exception as e:
+        print("ERROR IN user-projects:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/time-entries/sync-batch")
+def sync_time_entries_batch(payload: SyncPayload, db: Session = Depends(get_db)):
+    try:
+        synced_count = 0
+        conflicts = []
+
+        for entry in payload.entries:
+            # بررسی اینکه آیا این رکورد قبلاً با این id در سرور ثبت شده است یا خیر
+            check_sql = text(f"SELECT id, approval_status FROM {payload.tenantSchema}.time_entries WHERE id = :id")
+            existing = db.execute(check_sql, {"id": entry.id}).fetchone()
+
+            if existing:
+                # اگر رکورد قبلاً توسط ادمین تایید شده باشد و کاربر لوکال تغییرش داده باشد (تضاد)
+                if existing.approval_status == 'approved':
+                    conflicts.append({"id": entry.id, "reason": "Already approved by admin, local changes ignored."})
+                    continue
+                else:
+                    # آپدیت رکورد موجود اگر هنوز در حالت pending است
+                    update_sql = text(f"""
+                        UPDATE {payload.tenantSchema}.time_entries 
+                        SET start_time = :start_time, end_time = :end_time, duration = :duration, note = :note
+                        WHERE id = :id
+                    """)
+                    db.execute(update_sql, {
+                        "id": entry.id,
+                        "start_time": entry.startTime,
+                        "end_time": entry.endTime,
+                        "duration": entry.duration,
+                        "note": entry.note
+                    })
+            else:
+                # درج رکورد جدید (Upsert / Insert)
+                insert_sql = text(f"""
+                    INSERT INTO {payload.tenantSchema}.time_entries 
+                    (id, user_id, project_id, project_name, client_name, start_time, end_time, duration, note, approval_status, synced_at)
+                    VALUES (:id, :user_id, :project_id, :project_name, :client_name, :start_time, :end_time, :duration, :note, 'pending', NOW())
+                """)
+                db.execute(insert_sql, {
+                    "id": entry.id,
+                    "user_id": payload.userId,
+                    "project_id": entry.projectId,
+                    "project_name": entry.projectName,
+                    "client_name": entry.clientName,
+                    "start_time": entry.startTime,
+                    "end_time": entry.endTime,
+                    "duration": entry.duration,
+                    "note": entry.note
+                })
+            synced_count += 1
+
+        db.commit()
+        return {"status": "success", "syncedCount": synced_count, "conflicts": conflicts}
+    except Exception as e:
+        db.rollback()
+        print("ERROR IN SYNC BATCH:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/export-datev")
+def export_datev_report(tenantSchema: str, year: int, month: int, db: Session = Depends(get_db)):
+    try:
+        # استخراج رکوردهای تاییدشده‌ی ماه مورد نظر
+        sql = text(f"""
+            SELECT te.user_id, te.project_name, te.duration, te.start_time, te.note, te.approval_status
+            FROM {tenantSchema}.time_entries te
+            WHERE EXTRACT(YEAR FROM TO_TIMESTAMP(te.start_time / 1000.0)) = :year
+              AND EXTRACT(MONTH FROM TO_TIMESTAMP(te.start_time / 1000.0)) = :month
+              AND te.approval_status = 'approved'
+        """)
+        entries = db.execute(sql, {"year": year, "month": month}).fetchall()
+
+        # ساخت فایل CSV در حافظه (In-Memory Buffer)
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=';') # استاندارد آلمان معمولاً با کاما (;) کار می‌کند
+        
+        # هدرهای استاندارد برای گزارش ساعت کارکرد
+        writer.writerow(["UserID", "Project", "Date", "Hours", "Note", "Status"])
+
+        for row in entries:
+            date_str = datetime.fromtimestamp(row.start_time / 1000.0).strftime('%d.%m.%Y')
+            hours_val = round(row.duration / 60, 2) # تبدیل دقیقه به ساعت اعشاری
+            writer.writerow([
+                row.user_id,
+                row.project_name,
+                date_str,
+                str(hours_val).replace('.', ','), # استاندارد عدد اعشاری در آلمان با کاما است
+                row.note or "",
+                row.approval_status
+            ])
+
+        output.seek(0)
+        
+        # بازگرداندن فایل به صورت استریم برای دانلود
+        response = StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv"
+        )
+        response.headers["Content-Disposition"] = f"attachment; filename=DATEV_Report_{year}_{month:02d}.csv"
+        return response
+
+    except Exception as e:
+        print("ERROR IN DATEV EXPORT:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/compliance-reminders")
+def check_admin_reminders(tenantSchema: str, db: Session = Depends(get_db)):
+    try:
+        current_day = datetime.now().day
+        
+        # اگر در ۵ روز پایانی ماه باشیم، رکوردهای پندینگ را چک می‌کنیم
+        if current_day >= 25:
+            sql = text(f"""
+                SELECT COUNT(*) as pending_count 
+                FROM {tenantSchema}.time_entries 
+                WHERE approval_status = 'pending'
+            """)
+            result = db.execute(sql).fetchone()
+            pending_count = result.pending_count if result else 0
+            
+            if pending_count > 0:
+                return {
+                    "hasReminder": True,
+                    "message": f"Reminder: You have {pending_count} unapproved time entries waiting before month-end payroll processing."
+                }
+                
+        return {"hasReminder": False}
+    except Exception as e:
+        return {"hasReminder": False, "error": str(e)}
+
+@app.put("/projects/update")
+def update_project(payload: ProjectUpdateRequest, db: Session = Depends(get_db)):
+    try:
+        query = text(f"""
+            UPDATE {payload.tenantSchema}.projects
+            SET name = :name, 
+                description = :description, 
+                is_active = :is_active
+            WHERE id = :project_id
+        """)
+        
+        db.execute(
+            query, 
+            {
+                "name": payload.name, 
+                "description": payload.description, 
+                "is_active": payload.isActive, 
+                "project_id": payload.projectId
+            }
+        )
+
+#        query_entries = text(f"""
+#                    UPDATE {payload.tenantSchema}.time_entries
+#                    SET project_name = :name
+#                    WHERE project_id = :project_id
+#                """)
+#        db.execute(query_entries, {
+#                    "name": payload.name, 
+#                    "project_id": payload.projectId
+#                })
+
+        db.commit()
+        
+        return {"status": "success", "message": "Project updated successfully"}
+    except Exception as e:
+        db.rollback()
+        print("ERROR IN update-project:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get("/reports/by-project")
+def get_report_by_project(tenantSchema: str, year: int, month: int, db: Session = Depends(get_db)):
+    try:
+        import calendar
+        from datetime import datetime
+        start_date = datetime(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        end_date = datetime(year, month, last_day, 23, 59, 59)
+        
+        start_ts = int(start_date.timestamp() * 1000)
+        end_ts = int(end_date.timestamp() * 1000)
+
+        query = text(f"""
+            SELECT 
+                        p.id AS project_id,
+                        p.name,
+                        p.is_active,
+                        t.client_name,
+                        COALESCE(SUM(t.duration), 0) AS total_minutes,
+                        COUNT(t.id) AS total_entries,
+                        MAX(t.client_name) AS client_name
+                    FROM {tenantSchema}.projects p
+                    LEFT JOIN {tenantSchema}.time_entries t ON p.id = t.project_id 
+                        AND t.start_time >= :start_ts AND t.start_time <= :end_ts
+                    GROUP BY p.id, p.name, p.is_active, t.client_name
+                    ORDER BY t.client_name, total_minutes DESC
+            """)
+        results = db.execute(query, {"start_ts": start_ts, "end_ts": end_ts}).fetchall()
+        
+        report_data = [
+            {
+                "projectId": str(row.project_id),
+                "projectName": row.name,
+                "isActive": row.is_active,
+                "clientName": row.client_name,
+                "totalMinutes": row.total_minutes,
+                "totalEntries": row.total_entries
+            } for row in results
+        ]
+        
+        return {"status": "success", "report": report_data}
+    except Exception as e:
+        print("ERROR IN project report:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/admin/absences/approval")
+def update_absence_approval(payload: AbsenceApprovalRequest, db: Session = Depends(get_db)):
+    try:
+        query = text(f"""
+            UPDATE {payload.tenantSchema}.absences
+            SET approval_status = :status
+            WHERE id = :absence_id
+        """)
+        db.execute(query, {"status": payload.status, "absence_id": payload.absenceId})
+        db.commit()
+        return {"status": "success", "message": f"Absence status updated to {payload.status}"}
+    except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
