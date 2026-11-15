@@ -12,7 +12,6 @@ from uuid import UUID
 from passlib.context import CryptContext
 from pydantic import BaseModel
 import bcrypt
-from pydantic import BaseModel
 from typing import List, Optional
 import io
 import csv
@@ -217,6 +216,21 @@ class AbsenceApprovalRequest(BaseModel):
     tenantSchema: str
     absenceId: str
     status: str  # 'approved' یا 'rejected'
+
+class UserStatusRequest(BaseModel):
+    tenantSchema: str = Field(..., alias="tenantSchema")
+    userId: str = Field(..., alias="userId")
+    isActive: bool = Field(..., alias="isActive")
+
+    class Config:
+        populate_by_name = True
+
+class UpdateUserAdminRequest(BaseModel):
+    fullName: str
+    email: str
+    isActive: bool
+    includeInReports: bool
+    tenantSchema: str
 
 # ---------------------------- Database Tables Setup -------------------------------
 
@@ -517,7 +531,7 @@ def sync_time_entries(payload: SyncPayload, db: Session = Depends(get_db)):
                 )
 
             project_exists = db.execute(
-                text(f"SELECT 1 FROM {schema}.projects WHERE id = :project_id"),
+                text(f"SELECT 1 FROM   WHERE id = :project_id"),
                 {"project_id": str(uuid_obj)}
             ).fetchone()
 
@@ -790,32 +804,47 @@ def get_monthly_audit_report(tenantSchema: str, year: int, month: int, db: Sessi
 @app.post("/time-entries/manual")
 def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_db)):
     schema = payload.tenantSchema
-
-
     
     # استفاده از uuid4 واقعی به جای رشته متنی
     entry_id = str(uuid.uuid4())
     
     approval_status = 'approved' if payload.isAdminAction else 'pending'
-
     
     try:
         ensure_tenant_tables(schema, db)
         
-        # ۱. ابتدا محاسبه استراحت و اعتبارسنجی قوانین ArbZG
+        # 🌟 ۱. بررسی وجود و فعال بودن پروژه (جلوگیری از ثبت ساعت روی پروژه‌های غیرفعال)
+        project_check = db.execute(
+            text(f"SELECT is_active FROM {schema}.projects WHERE id = :project_id"),
+            {"project_id": payload.projectId}
+        ).fetchone()
+
+        if not project_check:
+            raise HTTPException(
+                status_code=400,
+                detail="Project does not exist in tenant schema."
+            )
+        
+        if not project_check.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot log time on a deactivated project."
+            )
+
+        # ۲. ابتدا محاسبه استراحت و اعتبارسنجی قوانین ArbZG
         break_mins = calculate_break_minutes(payload.breaks, payload.totalBreakDuration)
         validate_arbzg_rules(payload.duration, break_mins)
+        
         print(f"🔹 Inserting manual entry: {entry_id} for user {payload.userId} in schema {schema}")
         print(f"🔹 Start Time: {payload.startTime}, End Time: {payload.endTime}, Duration: {payload.duration}, Break Minutes: {break_mins}")
         print(f"🔹 Approval Status: {approval_status}, Project: {payload.projectName}, Client: {payload.clientName}")
 
-        # ۲. درج تایم انری در دیتابیس
+        # ۳. درج تایم انری در دیتابیس
         sql = text(f"""
             INSERT INTO {schema}.time_entries 
             (id, user_id, project_id, project_name, client_name, start_time, end_time, duration, is_manual, approval_status, synced_at)
             VALUES (:id, :user_id, :project_id, :project_name, :client_name, :start_time, :end_time, :duration, TRUE, :approval_status, NOW())
         """)
-        print(f"DEBUG ---> SQL Query: {sql}")
         
         db.execute(sql, {
             "id": entry_id,
@@ -829,7 +858,7 @@ def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_d
             "approval_status": approval_status
         })
 
-        # ۳. درج بازه‌های استراحت (در صورت وجود) در جدول breaks
+        # ۴. درج بازه‌های استراحت (در صورت وجود) در جدول breaks
         if payload.breaks:
             insert_break_sql = text(f"""
                 INSERT INTO {schema}.breaks 
@@ -852,14 +881,13 @@ def create_manual_entry(payload: ManualEntryRequest, db: Session = Depends(get_d
         return {"status": "success", "entryId": entry_id, "message": "Manual entry processed successfully."}
         
     except HTTPException as he:
-        # 👈 مهم: خطای 400 مربوط به قوانین ArbZG بدون دستکاری به فرانت‌اند می‌رسد
         db.rollback()
         raise he
     except Exception as e:
         db.rollback()
         print("🔴 ERROR IN MANUAL ENTRY:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-    
+        
 # 2. لیست کاربران شرکت (برای اینکه ادمین بدد برای چه کسی دارد ساعت ثبت می‌کند)
 @app.get("/admin/users-list")
 def get_tenant_users(tenantSchema: str, db: Session = Depends(get_db)):
@@ -934,6 +962,10 @@ class ApprovalActionRequest(BaseModel):
     tenantSchema: str = Field(..., alias="tenantSchema")
     entryId: str = Field(..., alias="entryId")
     status: str = Field(..., alias="status") # 'approved' یا 'rejected'
+    duration: Optional[int] = Field(None, alias="duration")
+    note: Optional[str] = Field(None, alias="note")
+    projectId: Optional[str] = Field(None, alias="projectId")
+    adminId: Optional[str] = Field("admin_user", alias="adminId")
 
     class Config:
         populate_by_name = True
@@ -942,44 +974,133 @@ class ApprovalActionRequest(BaseModel):
 def approve_time_entry(payload: ApprovalActionRequest, db: Session = Depends(get_db)):
     schema = payload.tenantSchema
     try:
+        # ۱. اول رکورد قبلی را می‌خوانیم تا user_id و اطلاعات قبلی را داشته باشیم
+        existing_entry = db.execute(text(f"""
+            SELECT id, user_id, project_id, project_name, client_name, duration, note, approval_status
+            FROM {schema}.time_entries WHERE id = :entry_id
+        """), {"entry_id": payload.entryId}).fetchone()
+        
+        if not existing_entry:
+            raise HTTPException(status_code=404, detail="Time entry not found.")
+
+        updates = ["approval_status = :status"]
+        params = {"status": payload.status, "entry_id": payload.entryId}
+        changes_detail = [f"Status changed from {existing_entry.approval_status} to {payload.status}"]
+
+        # 👈 ۲. این همان کدی است که فرستادید؛ دقیقا همینجا قرار می‌گیرد:
+        if payload.projectId and payload.projectId != str(existing_entry.project_id):
+            proj_row = db.execute(text(f"""
+                SELECT p.name as project_name, c.name as client_name
+                FROM {schema}.projects p
+                LEFT JOIN {schema}.clients c ON p.client_id = c.id
+                JOIN {schema}.user_projects up ON p.id::text = up.project_id
+                WHERE p.id = :proj_id 
+                  AND p.is_active = true 
+                  AND up.user_id = :user_id
+            """), {
+                "proj_id": payload.projectId, 
+                "user_id": existing_entry.user_id
+            }).fetchone()
+            
+            if not proj_row:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Selected project is either inactive, does not exist, or is not assigned to this employee."
+                )
+            
+            updates.append("project_id = :project_id")
+            updates.append("project_name = :project_name")
+            updates.append("client_name = :client_name")
+            params["project_id"] = payload.projectId
+            params["project_name"] = proj_row.project_name
+            params["client_name"] = proj_row.client_name or ""
+            changes_detail.append(f"Project changed to {proj_row.project_name}")
+
+        # ۳. بررسی تغییرات duration و note (در صورت ارسال توسط ادمین)
+        if payload.duration is not None and payload.duration != existing_entry.duration:
+            updates.append("duration = :duration")
+            params["duration"] = payload.duration
+            changes_detail.append(f"Duration changed from {existing_entry.duration} to {payload.duration}")
+
+        if payload.note is not None and payload.note != existing_entry.note:
+            updates.append("note = :note")
+            params["note"] = payload.note
+            changes_detail.append("Note updated")
+
+        # ۴. اجرای دستور UPDATE نهایی روی دیتابیس
         sql = text(f"""
-            UPDATE {schema}.time_entries 
-            SET approval_status = :status
+            UPDATE {schema}.time_entries
+            SET {", ".join(updates)}
             WHERE id = :entry_id
         """)
-        db.execute(sql, {"status": payload.status, "entry_id": payload.entryId})
         
+        # 🔍 اگر خواستید متون کوئری را در کنسول ببینید، این پرینت‌ها را هم فعال کنید:
+        print("🔍 --- SQL QUERY ---")
+        print(sql)
+        print("📦 --- PARAMS ---")
+        print(params)
+
+        db.execute(sql, params)
+
+        # ۵. ثبت در جدول audit_logs
+        log_audit_event(
+            db=db,
+            schema=schema,
+            admin_id="admin_user",
+            action_type="APPROVE_AND_EDIT_TIME_ENTRY",
+            target_type="TIME_ENTRY",
+            target_id=payload.entryId,
+            details=" | ".join(changes_detail)
+        )
+
         db.commit()
-        return {"status": "success", "message": f"Entry status updated to {payload.status}"}
+        return {"status": "success", "message": f"Entry updated successfully to {payload.status}"}
+        
+    except HTTPException as he:
+        db.rollback()
+        raise he
     except Exception as e:
         db.rollback()
+        print("ERROR IN approve_time_entry:", str(e))
         raise HTTPException(status_code=500, detail=f"Failed to update entry status: {str(e)}")
+            
 
 @app.get("/users/list")
-def get_users_list(tenantSchema: str, db: Session = Depends(get_db)):
+def list_users(
+    tenantSchema: str = Query(...), 
+    active_only: bool = Query(False), # 👈 پارامتر جدید برای فیلتر کردن
+    db: Session = Depends(get_db)
+):
     try:
-        query = text(f"""
-            SELECT id, full_name, email, role, COALESCE(include_in_reports, TRUE) as include_in_reports 
-            FROM {tenantSchema}.users
-        """)
-        users = db.execute(query).fetchall()
+        comp_id = tenantSchema.replace('tenant_', '').replace('_', '-')
         
-        return {
-            "users": [
-                {
-                    "id": str(u.id),
-                    "fullName": u.full_name,
-                    "email": u.email,
-                    "role": u.role,
-                    "includeInReports": bool(u.include_in_reports)
-                } for u in users
-            ]
-        }
+        # ساخت کوئری پایه
+        query_str = """
+            SELECT u.id, u.display_name, u.email, u.role, u.is_active 
+            FROM timetracker.users u
+            JOIN timetracker.company_users cu ON u.id = cu.user_id
+            WHERE cu.company_id = :company_id
+        """
+        
+        # اگر active_only برابر با True باشد، فقط کاربران فعال برگردانده می‌شوند
+        if active_only:
+            query_str += " AND (u.is_active = TRUE OR u.is_active IS NULL)"
+            
+        result = db.execute(text(query_str), {"company_id": comp_id}).fetchall()
+        
+        users_list = [{
+            "id": str(row.id),
+            "fullName": row.display_name,
+            "email": row.email,
+            "role": row.role,
+            "isActive": bool(row.is_active) if row.is_active is not None else True
+        } for row in result]
+        
+        return {"status": "success", "users": users_list}
     except Exception as e:
-        print("ERROR IN /users/list:", str(e))
+        print("🔴 ERROR IN list_users:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-    
 @app.post("/users/create")
 def create_user(payload: CreateUserRequest, db: Session = Depends(get_db)):
     schema = payload.tenantSchema
@@ -1037,13 +1158,17 @@ def get_assigned_projects(
         ensure_tenant_tables(tenantSchema, db)
         
         if isAdmin:
-            query = text(f"SELECT id, name, description, is_active FROM {tenantSchema}.projects;")
+            query = text(f"SELECT id, name, description, is_active FROM {tenantSchema}.projects WHERE is_active = true;")
             result = db.execute(query).fetchall()
+            print(f"DEBUG ---> SQL Query: {query}")
+            params = {"user_id": userId}
+            print(f"DEBUG ---> SQL Params: {params}")
         else:
             query = text(f"""
                 SELECT p.id, p.name, p.description, p.is_active FROM {tenantSchema}.projects p
                 JOIN {tenantSchema}.user_projects up ON p.id::text = up.project_id
-                WHERE up.user_id = :user_id;
+                WHERE up.user_id = :user_id
+                AND p.is_active = true;
             """)
             print(f"DEBUG ---> SQL Query: {query}")
             params = {"user_id": userId}
@@ -1185,14 +1310,12 @@ def register_company(payload: CompanyRegistrationRequest, db: Session = Depends(
         raise HTTPException(status_code=500, detail=str(e))    
 
 
-import bcrypt 
-
 @app.post("/auth/login", response_model=None)
 def login(payload: LoginPayload, db: Session = Depends(get_db)):
     try:
-        # ۱. پیدا کردن کاربر از روی ایمیل در جدول مرکزی
+        # ۱. پیدا کردن کاربر از روی ایمیل در جدول مرکزی (اضافه شدن is_active به SELECT)
         user_row = db.execute(text("""
-            SELECT id, display_name, role, password_hash 
+            SELECT id, display_name, role, password_hash, is_active 
             FROM timetracker.users 
             WHERE email = :email
         """), {"email": payload.email}).fetchone()
@@ -1201,8 +1324,16 @@ def login(payload: LoginPayload, db: Session = Depends(get_db)):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
         user_id = user_row[0]
-        stored_password_hash = user_row[3]
         role = user_row[2]
+        stored_password_hash = user_row[3]
+        is_active = user_row[4] # 👈 مقدار فیلتر فعال/غیرفعال بودن
+
+        # 🌟 بررسی اینکه آیا حساب کاربری غیرفعال است یا خیر
+        if is_active is False or is_active == 0:
+            raise HTTPException(
+                status_code=403, 
+                detail="Your account has been deactivated by the administrator."
+            )
 
         # ۲. اعتبارسنجی رمز عبور با bcrypt.checkpw (به جای pwd_context.verify)
         is_valid = bcrypt.checkpw(
@@ -1240,34 +1371,7 @@ def login(payload: LoginPayload, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"ERROR IN login: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.put("/admin/users/{user_id}/report-status")
-def update_user_report_status(user_id: str, payload: ReportStatusPayload, db: Session = Depends(get_db)):
-    try:
-        sql = text(f"""
-            UPDATE {payload.tenantSchema}.users 
-            SET include_in_reports = :include_in_reports 
-            WHERE id = :user_id
-        """)
-        db.execute(sql, {"include_in_reports": payload.includeInReports, "user_id": user_id})
-        log_audit_event(
-            db=db,
-            schema=payload.tenantSchema,
-            admin_id="admin_user", 
-            action_type="UPDATE_USER_REPORT_STATUS",
-            target_type="USER",
-            target_id=user_id,
-            details=f"Changed include_in_reports to {payload.includeInReports}"
-        )
-        db.commit()
-        
-        return {"status": "success", "message": "User report status updated successfully."}
-    except Exception as e:
-        db.rollback()
-        print("ERROR IN update_user_report_status:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
+    
 
 @app.get("/admin/user-projects/{user_id}")
 def get_user_assigned_projects(tenantSchema: str, user_id: str, db: Session = Depends(get_db)):
@@ -1519,4 +1623,116 @@ def update_absence_approval(payload: AbsenceApprovalRequest, db: Session = Depen
         return {"status": "success", "message": f"Absence status updated to {payload.status}"}
     except Exception as e:
         db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/time/list")
+def get_time_entries(tenantSchema: str, userId: Optional[str] = None, date: Optional[str] = None, db: Session = Depends(get_db)):
+    try:
+        ensure_tenant_tables(tenantSchema, db)
+        
+        query_str = f"""
+            SELECT id, user_id, project_id, project_name, client_name, 
+                   start_time, end_time, duration, note, approval_status, is_manual
+            FROM {tenantSchema}.time_entries
+            WHERE 1=1
+        """
+        params = {}
+        
+        # 🛡️ فیلتر امنیتی برای اینکه هر کاربر فقط رکوردهای خودش را ببیند
+        if userId and userId != "undefined" and userId != "":
+            query_str += " AND user_id = :user_id"
+            params["user_id"] = userId
+            
+        if date:
+            # استفاده از تابع استاندارد دیتابیس برای مقایسه دقیق تاریخ بدون خطای Timezone
+            query_str += " AND DATE(TO_TIMESTAMP(start_time / 1000.0)) = :date"
+            params["date"] = date
+            
+        query_str += " ORDER BY start_time DESC"
+        
+        rows = db.execute(text(query_str), params).fetchall()
+        
+        entries = [{
+            "id": r.id,
+            "userId": r.user_id,
+            "projectId": str(r.project_id),
+            "projectName": r.project_name,
+            "clientName": r.client_name,
+            "startTime": r.start_time,
+            "endTime": r.end_time,
+            "duration": r.duration,
+            "note": r.note,
+            "approvalStatus": r.approval_status,
+            "isManual": r.is_manual
+        } for r in rows]
+        
+        return {"entries": entries}
+    except Exception as e:
+        print("ERROR IN /time/list:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/users/status")
+def update_user_status(payload: UserStatusRequest, db: Session = Depends(get_db)):
+    schema = payload.tenantSchema
+    try:
+        # آپدیت وضعیت is_active در جدول users
+        sql = text(f"""
+            UPDATE {schema}.users
+            SET is_active = :is_active
+            WHERE id = :user_id
+        """)
+        db.execute(sql, {
+            "is_active": payload.isActive,
+            "user_id": payload.userId
+        })
+        db.commit()
+        
+        # ثبت در لاگ حسابرسی (Audit Logs) برای امنیت و نظارت
+        log_audit_event(
+            db=db,
+            schema=schema,
+            admin_id="admin_user",
+            action_type="UPDATE_USER_STATUS",
+            target_type="USER",
+            target_id=payload.userId,
+            details=f"User status changed to active={payload.isActive}"
+        )
+
+        return {"status": "success", "message": f"User status successfully updated to {payload.isActive}"}
+    except Exception as e:
+        db.rollback()
+        print("🔴 ERROR IN UPDATE USER STATUS:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/admin/users/{user_id}")
+def update_user_by_admin(user_id: str, payload: UpdateUserAdminRequest, db: Session = Depends(get_db)):
+    try:
+        # ۱. آپدیت اطلاعات اصلی کاربر در جدول مرکزی timetracker.users (شامل نام، ایمیل و is_active)
+        db.execute(text("""
+            UPDATE timetracker.users
+            SET display_name = :full_name, email = :email, is_active = :is_active
+            WHERE id = :user_id
+        """), {
+            "full_name": payload.fullName,
+            "email": payload.email,
+            "is_active": payload.isActive,
+            "user_id": user_id
+        })
+
+        # ۲. آپدیت وضعیت گزارش‌گیری در جدول اسکیما تننت (در صورت وجود جدول مربوطه)
+        # اگر جدول users در اسکیما تننت هم فیلد include_in_reports دارد:
+        db.execute(text(f"""
+            UPDATE {payload.tenantSchema}.users
+            SET include_in_reports = :include_reports
+            WHERE id = :user_id
+        """), {
+            "include_reports": payload.includeInReports,
+            "user_id": user_id
+        })
+
+        db.commit()
+        return {"status": "success", "message": "User updated successfully."}
+    except Exception as e:
+        db.rollback()
+        print("🔴 ERROR IN UPDATE USER:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
