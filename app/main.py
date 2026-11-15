@@ -710,8 +710,8 @@ def request_absence(payload: AbsenceRequest, db: Session = Depends(get_db)):
     try:
         ensure_tenant_tables(schema, db)
         sql = text(f"""
-            INSERT INTO {schema}.absences (id, user_id, absence_type, start_date, end_date, note)
-            VALUES (:id, :user_id, :type, :start_date, :end_date, :note)
+            INSERT INTO {schema}.absences (id, user_id, absence_type, start_date, end_date, note, is_approved)
+            VALUES (:id, :user_id, :type, :start_date, :end_date, :note, NULL)
         """)
         db.execute(sql, {
             "id": absence_id,
@@ -729,24 +729,50 @@ def request_absence(payload: AbsenceRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/absences/list")
-def get_user_absences(tenantSchema: str, user_id: str, db: Session = Depends(get_db)):
+def list_absences(
+    tenantSchema: str = Query(...), 
+    user_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
     try:
-        sql = text(f"""
-            SELECT id, absence_type, start_date, end_date, note, is_approved
-            FROM {tenantSchema}.absences WHERE user_id = :user_id ORDER BY start_date DESC
-        """)
-        rows = db.execute(sql, {"user_id": user_id}).fetchall()
-        result = [{
-            "id": r.id,
-            "absenceType": r.absence_type,
-            "startDate": str(r.start_date),
-            "endDate": str(r.end_date),
-            "note": r.note,
-            "isApproved": r.is_approved
-        } for r in rows]
-        return {"absences": result}
+        query_str = f"SELECT * FROM {tenantSchema}.absences"
+        params = {}
+        
+        if user_id:
+            query_str += " WHERE user_id = :user_id"
+            params["user_id"] = user_id
+        query_str += " ORDER BY start_date DESC "
+        
+        result = db.execute(text(query_str), params).mappings().fetchall() # 🌟 استفاده از mappings
+        
+        absences_list = []
+        for row in result:
+            # 🌟 استفاده از get برای جلوگیری از خطای AttributeError
+            is_approved_val = row.get("is_approved")
+            
+            if is_approved_val is True:
+                derived_status = 'approved'
+            elif is_approved_val is False:
+                derived_status = 'rejected'
+            else:
+                derived_status = 'pending'
+
+            absences_list.append({
+                "id": str(row.get("id")),
+                "absenceType": row.get("absence_type"),
+                "startDate": str(row.get("start_date")),
+                "endDate": str(row.get("end_date")),
+                "note": row.get("note"),
+                "isApproved": is_approved_val,
+                "approvalStatus": derived_status,
+                "userId": row.get("user_id")
+            })
+        
+        return {"status": "success", "absences": absences_list}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch absences: {str(e)}")
+        print("🔴 ERROR IN list_absences:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/admin/monthly-report")
@@ -1611,20 +1637,38 @@ def get_report_by_project(tenantSchema: str, year: int, month: int, db: Session 
 
 
 @app.put("/admin/absences/approval")
-def update_absence_approval(payload: AbsenceApprovalRequest, db: Session = Depends(get_db)):
+def update_absence_approval(payload: dict, db: Session = Depends(get_db)):
     try:
+        tenant_schema = payload.get("tenantSchema")
+        absence_id = payload.get("absenceId")
+        status = payload.get("status") # 'approved' یا 'rejected'
+        
+        if not tenant_schema or not absence_id or not status:
+            raise HTTPException(status_code=400, detail="Missing required fields")
+            
+        # تبدیل استتوس متنی به بولین برای فیلد is_approved
+        is_approved = True if status == "approved" else False
+        
+        # آپدیت رکورد در جدول absences در اسکیما مربوط به تننت
         query = text(f"""
-            UPDATE {payload.tenantSchema}.absences
-            SET approval_status = :status
+            UPDATE {tenant_schema}.absences 
+            SET is_approved = :is_approved
             WHERE id = :absence_id
         """)
-        db.execute(query, {"status": payload.status, "absence_id": payload.absenceId})
+        
+        db.execute(query, {
+            "is_approved": is_approved,
+            "status": status,
+            "absence_id": absence_id
+        })
         db.commit()
-        return {"status": "success", "message": f"Absence status updated to {payload.status}"}
+        
+        return {"status": "success", "message": f"Absence {status} successfully."}
     except Exception as e:
         db.rollback()
+        print("🔴 ERROR IN update_absence_approval:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-    
+        
 @app.get("/time/list")
 def get_time_entries(tenantSchema: str, userId: Optional[str] = None, date: Optional[str] = None, db: Session = Depends(get_db)):
     try:
