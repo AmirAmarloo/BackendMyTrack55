@@ -337,9 +337,6 @@ def ensure_tenant_tables(schema_name: str, db: Session):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        ALTER TABLE timetracker.users 
-        ADD COLUMN IF NOT EXISTS email VARCHAR(255) UNIQUE,
-        ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
 
         ALTER TABLE {schema_name}.users 
         ADD COLUMN IF NOT EXISTS email VARCHAR(255) UNIQUE,
